@@ -81,7 +81,12 @@ if(WITH_PYTHON)
   add_library(gnucash_core_c MODULE ${SWIG_GNUCASH_CORE_C})
   target_include_directories(gnucash_core_c PRIVATE ${gnucash_core_c_INCLUDE_DIRS})
 
-  target_link_libraries(gnucash_core_c gnc-app-utils gnc-engine ${Python3_LIBRARIES})
+  target_link_libraries(gnucash_core_c
+    gnc-app-utils
+    gnc-engine
+    $<$<TARGET_EXISTS:gncmod-backend-dbi>:gncmod-backend-dbi>
+    ${Python3_LIBRARIES}
+  )
   set_target_properties(gnucash_core_c PROPERTIES PREFIX "_")
   target_compile_options(gnucash_core_c PRIVATE -Wno-implicit -Wno-missing-prototypes -Wno-declaration-after-statement -Wno-missing-declarations)
   if (HAVE_STRINGOP_TRUNCATION)
