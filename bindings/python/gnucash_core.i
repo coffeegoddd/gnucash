@@ -98,8 +98,19 @@
 %ignore qof_session_not_saved;
 %include <qofsession.h>
 
-/* Dolt backend C API */
-%include "gnc-backend-dolt.h"
+/* Dolt backend C API: declare only the functions we need for Python.
+ * The C implementation is provided by gnc-backend-dolt.h/cpp included above.
+ */
+gboolean gnc_dolt_backend_is_dolt(QofBackend* be);
+gchar**  gnc_dolt_list_branches(QofBackend* be);
+gboolean gnc_dolt_create_branch(QofBackend* be, const gchar* branch);
+gboolean gnc_dolt_checkout_branch(QofBackend* be, const gchar* branch);
+gboolean gnc_dolt_add(QofBackend* be);
+gboolean gnc_dolt_commit(QofBackend* be,
+                         const gchar* message,
+                         const gchar* author,
+                         const gchar* email,
+                         gchar** out_commit_hash);
 
 %include <qofbook.h>
 

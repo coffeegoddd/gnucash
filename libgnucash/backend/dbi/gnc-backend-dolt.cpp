@@ -26,6 +26,7 @@
 #include <qof.h>
 
 #include "gnc-backend-dolt.hpp"
+#include "gnc-backend-dolt.h"
 #include "gnc-sql-result.hpp"
 
 GncDoltBackend::GncDoltBackend(GncSqlConnection* conn, QofBook* book)

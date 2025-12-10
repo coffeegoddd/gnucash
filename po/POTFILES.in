@@ -548,6 +548,7 @@ libgnucash/app-utils/gnc-ui-balances.cpp
 libgnucash/app-utils/gnc-ui-util.cpp
 libgnucash/app-utils/QuickFill.c
 libgnucash/backend/dbi/gnc-backend-dbi.cpp
+libgnucash/backend/dbi/gnc-backend-dolt.cpp
 libgnucash/backend/dbi/gnc-dbisqlconnection.cpp
 libgnucash/backend/dbi/gnc-dbisqlresult.cpp
 libgnucash/backend/sql/escape.cpp

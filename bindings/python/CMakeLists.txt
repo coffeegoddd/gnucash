@@ -33,6 +33,7 @@ set(GNUCASH_CORE_C_INCLUDES
     ${CMAKE_SOURCE_DIR}/libgnucash/engine/gncIDSearch.h
     ${CMAKE_SOURCE_DIR}/libgnucash/engine/gnc-pricedb.h
     ${CMAKE_SOURCE_DIR}/libgnucash/app-utils/gnc-prefs-utils.h
+    ${CMAKE_SOURCE_DIR}/libgnucash/backend/dbi
 )
 
 gnc_add_swig_python_command (swig-gnucash-core
@@ -69,6 +70,7 @@ if(WITH_PYTHON)
   set(gnucash_core_c_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/libgnucash
     ${CMAKE_SOURCE_DIR}/libgnucash/engine
+    ${CMAKE_SOURCE_DIR}/libgnucash/backend/dbi
     ${CMAKE_SOURCE_DIR}/gnucash/gnome-utils
     ${CMAKE_SOURCE_DIR}/libgnucash/app-utils
     ${CMAKE_SOURCE_DIR}/gnucash/gnome
