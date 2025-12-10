@@ -82,6 +82,7 @@
 #include "gnc-prefs-utils.h"
 #include "cap-gains.h"
 #include "Scrub3.h"
+#include "gnc-backend-dolt.h"
 %}
 
 %include <time64.i>
@@ -96,6 +97,9 @@
 // ignored because SWIG attempts to link against (to create language bindings)
 %ignore qof_session_not_saved;
 %include <qofsession.h>
+
+/* Dolt backend C API */
+%include "gnc-backend-dolt.h"
 
 %include <qofbook.h>
 

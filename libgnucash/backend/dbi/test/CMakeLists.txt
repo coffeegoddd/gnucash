@@ -25,6 +25,7 @@ set(test_dbi_backend_SOURCES
   test-backend-dbi-basic.cpp
   test-dbi-business-stuff.cpp
   test-dbi-stuff.cpp
+  test-dolt-backend.cpp
   ../gnc-backend-dbi.cpp
   ../gnc-dbisqlconnection.cpp
   ../gnc-dbisqlresult.cpp

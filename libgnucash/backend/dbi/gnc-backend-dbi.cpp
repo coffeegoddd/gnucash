@@ -70,6 +70,7 @@
 #include <gnc-sql-object-backend.hpp>
 #include "gnc-dbisqlresult.hpp"
 #include "gnc-dbisqlconnection.hpp"
+#include "gnc-backend-dolt.hpp"
 
 #if LIBDBI_VERSION >= 900
 #define HAVE_LIBDBI_R 1
@@ -104,11 +105,41 @@ public:
     QofDbiBackendProvider(QofDbiBackendProvider&&) = delete;
     QofDbiBackendProvider operator=(QofDbiBackendProvider&&) = delete;
     ~QofDbiBackendProvider () = default;
-    QofBackend* create_backend(void)
+    QofBackend* create_backend(void) override
     {
         return new GncDbiBackend<Type>(nullptr, nullptr);
     }
-    bool type_check(const char* type) { return true; }
+    bool type_check(const char* type) override { return type != nullptr; }
+};
+
+/**
+ * Dolt backend provider.
+ *
+ * Registers GncDoltBackend under the \"dolt\" access method so that
+ * URIs like dolt://user:password@host/dbname select this backend.
+ */
+class QofDoltBackendProvider : public QofBackendProvider
+{
+public:
+    QofDoltBackendProvider(const char* name, const char* type) :
+        QofBackendProvider{name, type} {}
+    QofDoltBackendProvider(QofDoltBackendProvider&) = delete;
+    QofDoltBackendProvider operator=(QofDoltBackendProvider&) = delete;
+    QofDoltBackendProvider(QofDoltBackendProvider&&) = delete;
+    QofDoltBackendProvider operator=(QofDoltBackendProvider&&) = delete;
+    ~QofDoltBackendProvider() = default;
+
+    QofBackend* create_backend(void) override
+    {
+        return new GncDoltBackend(nullptr, nullptr);
+    }
+
+    bool type_check(const char* uri) override
+    {
+        // For now accept any dolt:// URI; connection errors will be
+        // reported by the underlying DBI layer.
+        return uri != nullptr;
+    }
 };
 
 /* ================================================================= */
@@ -1162,8 +1193,16 @@ gnc_module_init_backend_dbi (void)
     if (have_mysql_driver)
     {
         const char *name = "GnuCash Libdbi (MYSQL) Backend";
-        auto prov = QofBackendProvider_ptr(new QofDbiBackendProvider<DbType::DBI_MYSQL>{name, "mysql"});
+        auto prov = QofBackendProvider_ptr(
+            new QofDbiBackendProvider<DbType::DBI_MYSQL>{name, "mysql"});
         qof_backend_register_provider(std::move(prov));
+
+        /* Also register the Dolt backend, which builds on the MySQL
+         * DBI driver but exposes Dolt-specific functionality. */
+        const char *dolt_name = "GnuCash Dolt (MySQL) Backend";
+        auto dolt_prov = QofBackendProvider_ptr(
+            new QofDoltBackendProvider{dolt_name, "dolt"});
+        qof_backend_register_provider(std::move(dolt_prov));
     }
 
     if (have_pgsql_driver)
