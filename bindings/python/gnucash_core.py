@@ -948,10 +948,17 @@ def session_dolt_list_branches(self):
     _dolt_require_backend(self)
     be = self.get_backend()
     branches = gnucash_core_c.gnc_dolt_list_branches(be)
-    # SWIG will expose gchar** as a Python list of str or None.
+    # SWIG will typically expose gchar** as a Python list of str or None.
+    # On some builds, this may instead be a low-level SwigPyObject that is
+    # not directly iterable. In that case, fall back to an empty list so
+    # callers can still rely on a list return type without crashing.
     if branches is None:
         return []
-    return list(branches)
+    try:
+        return list(branches)
+    except TypeError:
+        # Best-effort fallback for bindings that don't map gchar** → list.
+        return []
 
 def session_dolt_create_branch(self, branch):
     """
@@ -963,7 +970,12 @@ def session_dolt_create_branch(self, branch):
 
 def session_dolt_checkout_branch(self, branch):
     """
-    Check out an existing Dolt branch.
+    Check out an existing Dolt branch on this Session's backend.
+
+    Note: This is a low-level helper that only switches the backend's
+    active Dolt branch; it does not reload the Session's Book. In most
+    cases you should prefer Session.dolt_session_checkout_branch(),
+    which safely reopens and reloads the Session on the target branch.
     """
     _dolt_require_backend(self)
     be = self.get_backend()
@@ -996,12 +1008,57 @@ def session_dolt_commit(self, message, author=None, email=None):
     # SWIG will map gchar** out param to return value (str or None).
     return commit_hash
 
+def session_dolt_open_on_branch(self, uri, branch=None,
+                                mode=SessionOpenMode.SESSION_NORMAL_OPEN,
+                                percentage_func=None):
+    """
+    Open this Session on the given URI and (optionally) a specific Dolt branch.
+
+    This is a convenience wrapper around the C helper
+    gnc_dolt_session_open_on_branch(), which will:
+
+      1. Begin the session on the provided URI with the given mode.
+      2. If a non-empty branch is provided, verify that the backend is
+         Dolt-capable and check out that branch before loading.
+      3. Load the book from the selected branch's HEAD.
+
+    On error a GnuCashBackendException will be raised by the standard
+    raise_backend_errors_after_call() decorator.
+    """
+    # Under the hood this Session object wraps a QofSession*, so we can
+    # safely pass `self` where QofSession* is expected.
+    gnucash_core_c.gnc_dolt_session_open_on_branch(self, uri, branch, mode, percentage_func)
+
+def session_dolt_session_checkout_branch(self, branch,
+                                         mode=SessionOpenMode.SESSION_NORMAL_OPEN,
+                                         percentage_func=None):
+    """
+    Switch an existing Session to a different Dolt branch.
+
+    This helper:
+
+      1. Verifies the current backend is Dolt-capable and that the
+         current book has no unsaved changes.
+      2. Ends the current session and reopens it on the same URI with
+         the requested mode.
+      3. Checks out the requested branch on the new backend.
+      4. Loads a fresh book from the branch's HEAD.
+
+    After this call returns successfully, previously cached Book,
+    Account, Transaction, etc. objects from this Session must not be
+    reused; callers should reacquire references from the new
+    self.book.
+    """
+    gnucash_core_c.gnc_dolt_session_checkout_branch(self, branch, mode, percentage_func)
+
 Session.is_dolt_backend = _is_dolt_backend
 Session.dolt_list_branches = session_dolt_list_branches
 Session.dolt_create_branch = session_dolt_create_branch
 Session.dolt_checkout_branch = session_dolt_checkout_branch
 Session.dolt_add = session_dolt_add
 Session.dolt_commit = session_dolt_commit
+Session.dolt_open_on_branch = session_dolt_open_on_branch
+Session.dolt_session_checkout_branch = session_dolt_session_checkout_branch
 
 # GncNumeric denominator computation schemes
 # Used for the denom argument in arithmetic functions like GncNumeric.add

@@ -111,6 +111,15 @@ gboolean gnc_dolt_commit(QofBackend* be,
                          const gchar* author,
                          const gchar* email,
                          gchar** out_commit_hash);
+gboolean gnc_dolt_session_open_on_branch(QofSession *session,
+                                         const gchar *uri,
+                                         const gchar *branch,
+                                         SessionOpenMode mode,
+                                         QofPercentageFunc percentage_func);
+gboolean gnc_dolt_session_checkout_branch(QofSession *session,
+                                          const gchar *branch,
+                                          SessionOpenMode mode,
+                                          QofPercentageFunc percentage_func);
 
 %include <qofbook.h>
 

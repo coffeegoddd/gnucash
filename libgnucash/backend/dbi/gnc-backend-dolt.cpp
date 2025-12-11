@@ -115,8 +115,13 @@ GncDoltBackend::dolt_checkout_branch(const std::string& branch,
         return false;
     }
 
-    /* Refuse to switch branches if the book has unsaved changes. */
-    if (qof_book_session_not_saved(m_book))
+    /*
+     * Refuse to switch branches if there is an existing, unsaved book
+     * attached to this backend. However, allow branch checkout before
+     * any book has been loaded (m_book == nullptr) so that callers can
+     * select a branch prior to the initial load.
+     */
+    if (m_book && qof_book_session_not_saved(m_book))
     {
         error_out = "Cannot checkout Dolt branch while book has unsaved changes";
         set_error(ERR_BACKEND_MISC);
@@ -214,11 +219,53 @@ GncDoltBackend::dolt_commit(const std::string& message,
 void
 GncDoltBackend::safe_sync(QofBook* book)
 {
-    // First perform the normal MySQL safe_sync logic.
-    GncDbiBackend<DbType::DBI_MYSQL>::safe_sync(book);
+    /*
+     * For Dolt-backed stores we want safe_sync() to guarantee that any
+     * in-memory changes are both flushed to the SQL working set and
+     * committed to the current Dolt branch.
+     *
+     * Earlier revisions of this backend assumed that callers such as
+     * diffcash would always invoke Session.save() before safe_save(),
+     * so the book was already synced and safe_sync() only needed to
+     * perform DOLT_ADD/DOLT_COMMIT. That assumption doesn't hold for
+     * generic callers that only ever use qof_session_safe_save(), in
+     * which case changes might never be written to the database.
+     *
+     * To make safe_sync() self-contained while still avoiding the
+     * MySQL-specific index juggling that Dolt may reject (see
+     * GncDbiBackend<DbType::DBI_MYSQL>::safe_sync), we:
+     *
+     *   1. If the QofBook is dirty, flush it to the SQL working set
+     *      using the generic SQL backend's sync() implementation.
+     *   2. If auto-commit is enabled, stage and commit the resulting
+     *      working set via DOLT_ADD + DOLT_COMMIT.
+     *
+     * This ensures that qof_session_safe_save() alone is sufficient
+     * to persist and commit changes for Dolt-backed sessions, while
+     * still allowing advanced callers to disable auto-commit and
+     * manage Dolt commits explicitly.
+     */
 
-    // If there was an error or auto-commit is disabled, stop here.
-    if (check_error() || !m_auto_commit)
+    if (book && qof_book_session_not_saved(book))
+    {
+        /*
+         * Flush any pending in-memory changes into the Dolt working
+         * set using the generic SQL sync() path. We deliberately do
+         * not delegate to the MySQL-safe safe_sync() implementation
+         * here, as its index juggling can be rejected by Dolt.
+         */
+        GncSqlBackend::sync(book);
+
+        if (check_error())
+        {
+            // Propagate SQL-level errors to the caller; do not attempt
+            // to stage or commit via Dolt if the flush failed.
+            return;
+        }
+    }
+
+    // If auto-commit is disabled, do nothing; callers control commit behavior.
+    if (!m_auto_commit)
         return;
 
     // Stage and commit all changes via Dolt.
@@ -378,6 +425,115 @@ gnc_dolt_commit(QofBackend* be,
         *out_commit_hash = g_strdup(hash.c_str());
 
     return TRUE;
+}
+
+gboolean
+gnc_dolt_session_open_on_branch(QofSession *session,
+                                const gchar *uri,
+                                const gchar *branch,
+                                SessionOpenMode mode,
+                                QofPercentageFunc percentage_func)
+{
+    if (!session || !uri)
+        return FALSE;
+
+    /* Begin the session on the requested URI. */
+    qof_session_begin(session, uri, mode);
+    if (qof_session_get_error(session) != ERR_BACKEND_NO_ERR)
+        return FALSE;
+
+    /* If no branch was specified, just load as usual. */
+    if (!branch || *branch == '\0')
+    {
+        qof_session_load(session, percentage_func);
+        return qof_session_get_error(session) == ERR_BACKEND_NO_ERR;
+    }
+
+    /* Branch was specified: backend must be Dolt-capable. */
+    auto be = qof_session_get_backend(session);
+    if (!be || !gnc_dolt_backend_is_dolt(be))
+    {
+        if (be)
+        {
+            be->set_error(ERR_BACKEND_NO_HANDLER);
+            be->set_message("Session backend is not Dolt-capable");
+        }
+        return FALSE;
+    }
+
+    /* Checkout the desired branch before the initial load. */
+    if (!gnc_dolt_checkout_branch(be, branch))
+        return FALSE;
+
+    /* Load the book from the selected branch's HEAD. */
+    qof_session_load(session, percentage_func);
+    return qof_session_get_error(session) == ERR_BACKEND_NO_ERR;
+}
+
+gboolean
+gnc_dolt_session_checkout_branch(QofSession *session,
+                                 const gchar *branch,
+                                 SessionOpenMode mode,
+                                 QofPercentageFunc percentage_func)
+{
+    if (!session || !branch || *branch == '\0')
+        return FALSE;
+
+    auto be = qof_session_get_backend(session);
+    if (!be || !gnc_dolt_backend_is_dolt(be))
+    {
+        if (be)
+        {
+            be->set_error(ERR_BACKEND_NO_HANDLER);
+            be->set_message("Session backend is not Dolt-capable");
+        }
+        return FALSE;
+    }
+
+    auto book = qof_session_get_book(session);
+    if (book && qof_book_session_not_saved(book))
+    {
+        be->set_error(ERR_BACKEND_MISC);
+        be->set_message("Cannot checkout Dolt branch while book has unsaved changes");
+        return FALSE;
+    }
+
+    const char *uri = qof_session_get_url(session);
+    if (!uri || *uri == '\0')
+    {
+        be->set_error(ERR_BACKEND_BAD_URL);
+        be->set_message("Session has no URL; cannot reopen on Dolt branch");
+        return FALSE;
+    }
+
+    std::string uri_copy{uri};
+
+    /*
+     * End the current session (releasing any backend resources) and
+     * reopen it on the same URI before checking out the new branch.
+     */
+    qof_session_end(session);
+
+    qof_session_begin(session, uri_copy.c_str(), mode);
+    if (qof_session_get_error(session) != ERR_BACKEND_NO_ERR)
+        return FALSE;
+
+    be = qof_session_get_backend(session);
+    if (!be || !gnc_dolt_backend_is_dolt(be))
+    {
+        if (be)
+        {
+            be->set_error(ERR_BACKEND_NO_HANDLER);
+            be->set_message("Session backend is not Dolt-capable after reopen");
+        }
+        return FALSE;
+    }
+
+    if (!gnc_dolt_checkout_branch(be, branch))
+        return FALSE;
+
+    qof_session_load(session, percentage_func);
+    return qof_session_get_error(session) == ERR_BACKEND_NO_ERR;
 }
 
 } /* extern \"C\" */
