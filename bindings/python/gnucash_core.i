@@ -121,6 +121,48 @@ gboolean gnc_dolt_session_checkout_branch(QofSession *session,
                                           SessionOpenMode mode,
                                           QofPercentageFunc percentage_func);
 
+/* SWIG typemap: convert gchar** branch lists to Python lists of str.
+ *
+ * gnc_dolt_list_branches allocates a NULL-terminated gchar** vector that
+ * must be freed by the caller via g_strfreev. Without this typemap SWIG
+ * exposes the return value as an opaque SwigPyObject which is not iterable
+ * from Python code. This typemap makes the function behave as expected in
+ * gnucash_core.py: a list[str] (or [] when no branches exist).
+ */
+%typemap(out) gchar ** {
+    if ($1 == NULL)
+    {
+        $result = PyList_New(0);
+    }
+    else
+    {
+        PyObject *lst = PyList_New(0);
+        if (!lst)
+        {
+            g_strfreev($1);
+            SWIG_fail;
+        }
+
+        gchar **p = $1;
+        while (*p != NULL)
+        {
+            PyObject *s = PyUnicode_FromString(*p);
+            if (!s)
+            {
+                g_strfreev($1);
+                Py_DECREF(lst);
+                SWIG_fail;
+            }
+            PyList_Append(lst, s);
+            Py_DECREF(s);
+            ++p;
+        }
+
+        g_strfreev($1);
+        $result = lst;
+    }
+}
+
 %include <qofbook.h>
 
 %include <qofid.h>
