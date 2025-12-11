@@ -2,6 +2,7 @@
 set(BACKEND_DBI_TEST_INCLUDE_DIRS
   ${CMAKE_BINARY_DIR}/common # for config.h
   ${CMAKE_SOURCE_DIR}/libgnucash/core-utils
+  ${CMAKE_SOURCE_DIR}/libgnucash/backend/dbi
   ${CMAKE_SOURCE_DIR}/libgnucash/backend/dbi/test
   ${CMAKE_SOURCE_DIR}/libgnucash/backend/sql
   ${CMAKE_SOURCE_DIR}/libgnucash/engine
@@ -11,9 +12,11 @@ set(BACKEND_DBI_TEST_INCLUDE_DIRS
 )
 set(BACKEND_DBI_TEST_LIBS
   gnc-backend-sql
+  gncmod-backend-dbi
   gnc-engine
   gnc-test-engine
   test-core
+  gtest
   ${Boost_REGEX_LIBRARY}
   ${LIBDBI_LIBRARY}
   $<$<BOOL:${WIN32}>:${WINSOCK_LIB}>

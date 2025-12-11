@@ -18,6 +18,7 @@
 #include "qofbook.h"
 #include "qofbackend.h"
 
+#include "gnc-backend-dbi.h"
 #include "gnc-backend-dolt.h"
 
 namespace {
@@ -27,6 +28,12 @@ class DoltBackendTest : public ::testing::Test
 protected:
     void SetUp() override
     {
+        /* Ensure the DBI backend and its libdbi instance are initialized
+         * before attempting to open any Dolt-backed sessions. The GLib
+         * test fixtures finalize the backend after each run, so we need
+         * to re-initialize here for the GoogleTest-based suite. */
+        gnc_module_init_backend_dbi();
+
         url = std::getenv("TEST_DOLT_URL");
         if (!url)
             GTEST_SKIP() << "TEST_DOLT_URL not set; skipping Dolt backend tests";

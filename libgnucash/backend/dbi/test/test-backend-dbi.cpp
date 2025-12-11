@@ -22,6 +22,7 @@
 #include <glib.h>
 
 #include <config.h>
+#include <gtest/gtest.h>
 #include "qof.h"
 #include "cashobjects.h"
 extern void test_suite_gnc_backend_dbi ();
@@ -48,7 +49,7 @@ main (int   argc,
     g_setenv ("GNC_UNINSTALLED", "1", TRUE);
     qof_init (); /* equally initializes gobject system */
     qof_log_init_filename_special ("stderr"); /* Init the log system */
-    g_test_init (&argc, &argv, NULL);       /* initialize test program */
+    g_test_init (&argc, &argv, NULL);       /* initialize GLib test program */
     g_test_bug_base ("https://bugs.gnucash.org/show_bug.cgi?id="); /* init the bugzilla URL */
     cashobjects_register ();
     g_assert_true (qof_load_backend_library (GNC_LIB_REL_PATH_1, GNC_LIB_NAME_1));
@@ -56,5 +57,17 @@ main (int   argc,
 
     test_suite_gnc_backend_dbi ();
 
-    return g_test_run ();
+    /* Run the existing GLib test suite first. */
+    int glib_result = g_test_run ();
+
+    /*
+     * Also run any Google Test-based suites that have been linked into this
+     * binary (for example, the Dolt backend tests in test-dolt-backend.cpp).
+     * These are reported via the usual gtest console output but share the
+     * same CTest test entry as the GLib tests.
+     */
+    ::testing::InitGoogleTest (&argc, argv);
+    int gtest_result = RUN_ALL_TESTS ();
+
+    return (glib_result != 0) || (gtest_result != 0);
 }

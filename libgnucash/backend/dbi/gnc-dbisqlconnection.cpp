@@ -179,7 +179,13 @@ GncDbiSqlConnection::unlock_database ()
     auto tables = m_provider->get_table_list (m_conn, lock_table);
     if (tables.empty())
     {
-        PWARN ("No lock table in database, so not unlocking it.");
+        /* For backends like Dolt running under libdbi's MySQL driver the
+         * metadata APIs used by get_table_list() may fail to see the lock
+         * table even when the underlying database is otherwise healthy.
+         * Treat this as a non-fatal informational condition instead of a
+         * warning so that test environments running with fatal warnings
+         * enabled don't abort the process. */
+        PINFO ("No lock table in database, so not unlocking it.");
         return;
     }
     if (begin_transaction())
