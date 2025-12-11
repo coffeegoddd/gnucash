@@ -24,6 +24,7 @@
 #include <config.h>
 #include <gtest/gtest.h>
 #include "qof.h"
+#include "qoflog.h"
 #include "cashobjects.h"
 extern void test_suite_gnc_backend_dbi ();
 
@@ -49,6 +50,12 @@ main (int   argc,
     g_setenv ("GNC_UNINSTALLED", "1", TRUE);
     qof_init (); /* equally initializes gobject system */
     qof_log_init_filename_special ("stderr"); /* Init the log system */
+
+    /* Enable detailed DEBUG/INFO logging for the DBI backend so that test
+     * runs provide full trace information about which database name and host
+     * are being used on each connection. */
+    qof_log_set_level ("gnc.backend.dbi", QOF_LOG_DEBUG);
+
     g_test_init (&argc, &argv, NULL);       /* initialize GLib test program */
     g_test_bug_base ("https://bugs.gnucash.org/show_bug.cgi?id="); /* init the bugzilla URL */
     cashobjects_register ();

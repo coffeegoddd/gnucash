@@ -170,12 +170,24 @@ UriStrings::UriStrings(const std::string& uri)
     m_protocol = std::string{scheme};
     m_host = std::string{host};
     if (dbname)
-	m_dbname = std::string{dbname};
+        m_dbname = std::string{dbname};
     if (username)
         m_username = std::string{username};
     if (password)
         m_password = std::string{password};
     m_portnum = portnum;
+
+    /* Trace how URIs are parsed into DB connection components so we can
+     * correlate test environment variables (like TEST_DOLT_URL) with the
+     * actual database name and host that libdbi will see. */
+    PINFO ("UriStrings: uri='%s' protocol='%s' host='%s' port=%d dbname='%s' user='%s'",
+           uri.c_str(),
+           m_protocol.c_str(),
+           m_host.c_str(),
+           m_portnum,
+           m_dbname.c_str(),
+           m_username.c_str());
+
     g_free(scheme);
     g_free(host);
     g_free(username);
@@ -242,6 +254,16 @@ GncDbiBackend<Type>::set_standard_connection_options (dbi_conn conn,
     options.push_back(std::make_pair("username", uri.m_username));
     options.push_back(std::make_pair("password", uri.m_password));
     options.push_back(std::make_pair("encoding", "UTF-8"));
+
+    /* Log the canonical connection options (especially dbname) that we pass
+     * into libdbi for easier correlation with server-side logs in tests. */
+    PINFO ("set_standard_connection_options: Type=%d host='%s' dbname='%s' user='%s' port=%d",
+           static_cast<int>(Type),
+           uri.m_host.c_str(),
+           uri.m_dbname.c_str(),
+           uri.m_username.c_str(),
+           uri.m_portnum);
+
     try
     {
         set_options(conn, options);
@@ -498,6 +520,16 @@ error_handler<DbType::DBI_MYSQL> (dbi_conn conn, void* user_data)
     const char* msg;
 
     auto err_num = dbi_conn_error (conn, &msg);
+
+    /* Provide additional context for MySQL/Dolt errors by logging the current
+     * dbname option as seen by libdbi. This is especially helpful when
+     * tracking down tests that accidentally connect to the wrong database. */
+    const char* current_db = dbi_conn_get_option (conn, "dbname");
+    PINFO ("MySQL DBI error handler: err_num=%d dbname='%s' message='%s'",
+           err_num,
+           current_db ? current_db : "(null)",
+           msg ? msg : "(null)");
+
     /* BADIDX is raised if we attempt to seek outside of a result. We
      * handle that possibility after checking the return value of the
      * seek. Having this raise a critical error breaks looping by
