@@ -400,6 +400,17 @@ error_handler<DbType::DBI_SQLITE> (dbi_conn conn, void* user_data)
      * testing for the return value of the seek.
      */
     if (err_num == DBI_ERROR_BADIDX) return;
+
+    /* Dolt reports "nothing to commit" as a generic MySQL error 1105.
+     * When this happens in response to a CALL DOLT_COMMIT() with no
+     * staged changes it's a benign condition and should not be treated
+     * as a backend error. Detect that specific message and ignore it.
+     */
+    if (err_num == 1105 && msg && g_strrstr(msg, "nothing to commit"))
+    {
+        PINFO ("Ignoring benign Dolt commit error: %s\n", msg);
+        return;
+    }
     PERR ("DBI error: %s\n", msg);
     if (dbi_be->connected())
         dbi_be->set_dbi_error (ERR_BACKEND_MISC, 0, false);
