@@ -98,20 +98,6 @@
 %ignore qof_session_not_saved;
 %include <qofsession.h>
 
-/* Dolt backend C API: declare only the functions we need for Python.
- * The C implementation is provided by gnc-backend-dolt.h/cpp included above.
- */
-gboolean gnc_dolt_backend_is_dolt(QofBackend* be);
-gchar**  gnc_dolt_list_branches(QofBackend* be);
-gboolean gnc_dolt_create_branch(QofBackend* be, const gchar* branch);
-gboolean gnc_dolt_checkout_branch(QofBackend* be, const gchar* branch);
-gboolean gnc_dolt_add(QofBackend* be);
-gboolean gnc_dolt_commit(QofBackend* be,
-                         const gchar* message,
-                         const gchar* author,
-                         const gchar* email,
-                         gchar** out_commit_hash);
-
 /* SWIG typemap: convert gchar** branch lists to Python lists of str.
  *
  * gnc_dolt_list_branches allocates a NULL-terminated gchar** vector that
@@ -153,6 +139,23 @@ gboolean gnc_dolt_commit(QofBackend* be,
         $result = lst;
     }
 }
+
+/* Dolt backend C API: declare only the functions we need for Python.
+ * The C implementation is provided by gnc-backend-dolt.h/cpp included above.
+ *
+ * IMPORTANT: The typemap above must appear before this declaration so SWIG
+ * applies it to the function return type.
+ */
+gboolean gnc_dolt_backend_is_dolt(QofBackend* be);
+gchar**  gnc_dolt_list_branches(QofBackend* be);
+gboolean gnc_dolt_create_branch(QofBackend* be, const gchar* branch);
+gboolean gnc_dolt_checkout_branch(QofBackend* be, const gchar* branch);
+gboolean gnc_dolt_add(QofBackend* be);
+gboolean gnc_dolt_commit(QofBackend* be,
+                         const gchar* message,
+                         const gchar* author,
+                         const gchar* email,
+                         gchar** out_commit_hash);
 
 %include <qofbook.h>
 
