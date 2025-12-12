@@ -69,58 +69,6 @@ gboolean gnc_dolt_commit(QofBackend* be,
                          const gchar* email,
                          gchar** out_commit_hash);
 
-/**
- * @brief Convenience helper to open a QofSession on a specific Dolt branch.
- *
- * This function combines qof_session_begin(), an optional Dolt branch
- * checkout, and qof_session_load() into a single call. If @a branch is
- * non-NULL and non-empty the backend must be Dolt-capable or the call
- * will fail.
- *
- * On failure, the underlying session and/or backend will have recorded
- * an appropriate QofBackendError which can be retrieved with
- * qof_session_get_error().
- *
- * @param session         Session to open.
- * @param uri             Backend URI to open (e.g. dolt://...).
- * @param branch          Optional Dolt branch name; if NULL or empty no
- *                        branch checkout is performed.
- * @param mode            Session open mode (see SessionOpenMode).
- * @param percentage_func Optional progress callback for qof_session_load().
- *
- * @return TRUE on success, FALSE on failure.
- */
-gboolean gnc_dolt_session_open_on_branch(QofSession *session,
-                                         const gchar *uri,
-                                         const gchar *branch,
-                                         SessionOpenMode mode,
-                                         QofPercentageFunc percentage_func);
-
-/**
- * @brief Switch an existing session to a different Dolt branch.
- *
- * This helper ends the current session, reopens it on the same URI
- * with the requested @a mode, checks out the requested Dolt @a branch
- * on the new backend, and then loads the book.
- *
- * If the current session's book has unsaved changes the function will
- * fail without modifying the session. On any other failure the session
- * may have been ended or reopened but not loaded; callers should check
- * qof_session_get_error() and decide whether to retry or destroy the
- * session.
- *
- * @param session         Existing session to retarget.
- * @param branch          Dolt branch name to check out.
- * @param mode            Session open mode for the reopened session.
- * @param percentage_func Optional progress callback for qof_session_load().
- *
- * @return TRUE on success, FALSE on failure.
- */
-gboolean gnc_dolt_session_checkout_branch(QofSession *session,
-                                          const gchar *branch,
-                                          SessionOpenMode mode,
-                                          QofPercentageFunc percentage_func);
-
 G_END_DECLS
 
 #endif /* GNC_BACKEND_DOLT_H */

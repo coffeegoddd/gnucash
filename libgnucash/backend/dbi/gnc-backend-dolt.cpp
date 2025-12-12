@@ -136,6 +136,11 @@ GncDoltBackend::dolt_checkout_branch(const std::string& branch,
     if (!execute_dolt_call(sql.str(), error_out))
         return false;
 
+    /* Record the explicitly selected Dolt branch so that subsequent
+     * Dolt write operations (safe_sync, dolt_add, dolt_commit) can
+     * verify that a branch has been chosen. */
+    m_current_branch = branch;
+
     /*
      * TODO: Consider reloading the book from the backend after the
      * branch switch so that in-memory state matches the checked-out
@@ -148,7 +153,15 @@ GncDoltBackend::dolt_checkout_branch(const std::string& branch,
 bool
 GncDoltBackend::dolt_add(std::string& error_out)
 {
-    // Stage all changes in the working set; equivalent to `dolt add -A`.
+    if (m_current_branch.empty())
+    {
+        error_out = "Cannot stage changes: no Dolt branch has been "
+                    "explicitly selected (call gnc_dolt_checkout_branch())";
+        return false;
+    }
+
+    // Stage all changes in the working set; equivalent to `dolt add -A`
+    // on the currently-selected Dolt branch.
     std::ostringstream sql;
     sql << "CALL DOLT_ADD(" << quote_string("-A") << ")";
 
@@ -162,6 +175,13 @@ GncDoltBackend::dolt_commit(const std::string& message,
                             std::string& new_commit_hash_out,
                             std::string& error_out)
 {
+    if (m_current_branch.empty())
+    {
+        error_out = "Cannot create Dolt commit: no branch has been "
+                    "explicitly selected (call gnc_dolt_checkout_branch())";
+        return false;
+    }
+
     if (message.empty())
     {
         error_out = "Commit message must not be empty";
@@ -245,6 +265,18 @@ GncDoltBackend::safe_sync(QofBook* book)
      * still allowing advanced callers to disable auto-commit and
      * manage Dolt commits explicitly.
      */
+
+    /* Require callers to have explicitly selected a Dolt branch via
+     * dolt_checkout_branch() before we touch the working set or create
+     * commits. This avoids silently writing to whatever branch the
+     * server considers current. */
+    if (m_current_branch.empty())
+    {
+        set_error(ERR_BACKEND_MISC);
+        set_message("Cannot perform safe_save on Dolt backend: no branch "
+                    "has been explicitly selected (call gnc_dolt_checkout_branch())");
+        return;
+    }
 
     if (book && qof_book_session_not_saved(book))
     {
@@ -425,115 +457,6 @@ gnc_dolt_commit(QofBackend* be,
         *out_commit_hash = g_strdup(hash.c_str());
 
     return TRUE;
-}
-
-gboolean
-gnc_dolt_session_open_on_branch(QofSession *session,
-                                const gchar *uri,
-                                const gchar *branch,
-                                SessionOpenMode mode,
-                                QofPercentageFunc percentage_func)
-{
-    if (!session || !uri)
-        return FALSE;
-
-    /* Begin the session on the requested URI. */
-    qof_session_begin(session, uri, mode);
-    if (qof_session_get_error(session) != ERR_BACKEND_NO_ERR)
-        return FALSE;
-
-    /* If no branch was specified, just load as usual. */
-    if (!branch || *branch == '\0')
-    {
-        qof_session_load(session, percentage_func);
-        return qof_session_get_error(session) == ERR_BACKEND_NO_ERR;
-    }
-
-    /* Branch was specified: backend must be Dolt-capable. */
-    auto be = qof_session_get_backend(session);
-    if (!be || !gnc_dolt_backend_is_dolt(be))
-    {
-        if (be)
-        {
-            be->set_error(ERR_BACKEND_NO_HANDLER);
-            be->set_message("Session backend is not Dolt-capable");
-        }
-        return FALSE;
-    }
-
-    /* Checkout the desired branch before the initial load. */
-    if (!gnc_dolt_checkout_branch(be, branch))
-        return FALSE;
-
-    /* Load the book from the selected branch's HEAD. */
-    qof_session_load(session, percentage_func);
-    return qof_session_get_error(session) == ERR_BACKEND_NO_ERR;
-}
-
-gboolean
-gnc_dolt_session_checkout_branch(QofSession *session,
-                                 const gchar *branch,
-                                 SessionOpenMode mode,
-                                 QofPercentageFunc percentage_func)
-{
-    if (!session || !branch || *branch == '\0')
-        return FALSE;
-
-    auto be = qof_session_get_backend(session);
-    if (!be || !gnc_dolt_backend_is_dolt(be))
-    {
-        if (be)
-        {
-            be->set_error(ERR_BACKEND_NO_HANDLER);
-            be->set_message("Session backend is not Dolt-capable");
-        }
-        return FALSE;
-    }
-
-    auto book = qof_session_get_book(session);
-    if (book && qof_book_session_not_saved(book))
-    {
-        be->set_error(ERR_BACKEND_MISC);
-        be->set_message("Cannot checkout Dolt branch while book has unsaved changes");
-        return FALSE;
-    }
-
-    const char *uri = qof_session_get_url(session);
-    if (!uri || *uri == '\0')
-    {
-        be->set_error(ERR_BACKEND_BAD_URL);
-        be->set_message("Session has no URL; cannot reopen on Dolt branch");
-        return FALSE;
-    }
-
-    std::string uri_copy{uri};
-
-    /*
-     * End the current session (releasing any backend resources) and
-     * reopen it on the same URI before checking out the new branch.
-     */
-    qof_session_end(session);
-
-    qof_session_begin(session, uri_copy.c_str(), mode);
-    if (qof_session_get_error(session) != ERR_BACKEND_NO_ERR)
-        return FALSE;
-
-    be = qof_session_get_backend(session);
-    if (!be || !gnc_dolt_backend_is_dolt(be))
-    {
-        if (be)
-        {
-            be->set_error(ERR_BACKEND_NO_HANDLER);
-            be->set_message("Session backend is not Dolt-capable after reopen");
-        }
-        return FALSE;
-    }
-
-    if (!gnc_dolt_checkout_branch(be, branch))
-        return FALSE;
-
-    qof_session_load(session, percentage_func);
-    return qof_session_get_error(session) == ERR_BACKEND_NO_ERR;
 }
 
 } /* extern \"C\" */

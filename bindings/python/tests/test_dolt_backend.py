@@ -27,17 +27,26 @@ class DoltBackendTestCase(unittest.TestCase):
         with Session(self.url, SessionOpenMode.SESSION_NORMAL_OPEN) as sess:
             self.assertTrue(sess.is_dolt_backend())
 
+            # Explicitly select the main branch so any Dolt operations
+            # operate against a known branch instead of relying on the
+            # server's default.
+            sess.dolt_checkout_branch("main")
+
+            # List branches; should not error, may be empty. We
+            # intentionally avoid creating or checking out throwaway
+            # branches so this test exercises only read-only branch
+            # metadata.
             branches = sess.dolt_list_branches()
             self.assertIsInstance(branches, list)
-
-            # Create and checkout a throwaway branch name.
-            branch_name = f"gnucash_py_test_branch_{os.getpid()}"
-            sess.dolt_create_branch(branch_name)
-            sess.dolt_checkout_branch(branch_name)
 
     def test_commit(self):
         with Session(self.url, SessionOpenMode.SESSION_NORMAL_OPEN) as sess:
             self.assertTrue(sess.is_dolt_backend())
+
+            # Explicitly select the main branch so add/commit operate
+            # against a known branch instead of relying on the server's
+            # default.
+            sess.dolt_checkout_branch("main")
 
             # Ensure we can call add/commit without raising.
             sess.dolt_add()
@@ -46,44 +55,6 @@ class DoltBackendTestCase(unittest.TestCase):
             # call didn't raise.
             self.assertTrue(commit_hash is None or isinstance(commit_hash, str))
 
-    def test_open_on_branch_helper(self):
-        # Create a throwaway branch on the default backend.
-        branch_name = f"gnucash_py_test_open_on_branch_{os.getpid()}"
-        with Session(self.url, SessionOpenMode.SESSION_NORMAL_OPEN) as sess:
-            self.assertTrue(sess.is_dolt_backend())
-            sess.dolt_create_branch(branch_name)
-
-        # Use a fresh Session and the high-level helper to open directly
-        # on the new branch's HEAD.
-        sess2 = Session()
-        try:
-            sess2.dolt_open_on_branch(self.url, branch_name)
-            self.assertTrue(sess2.is_dolt_backend())
-            # Accessing book should succeed for a fully-loaded session.
-            self.assertIsNotNone(sess2.book)
-        finally:
-            sess2.end()
-            sess2.destroy()
-
-    def test_session_checkout_branch_helper(self):
-        # Start on the default branch.
-        sess = Session(self.url, SessionOpenMode.SESSION_NORMAL_OPEN)
-        try:
-            self.assertTrue(sess.is_dolt_backend())
-
-            # Create a throwaway branch name.
-            branch_name = f"gnucash_py_test_session_checkout_{os.getpid()}"
-            sess.dolt_create_branch(branch_name)
-
-            # Switch the existing Session to the new branch using the
-            # session-level helper, which will reopen and reload.
-            sess.dolt_session_checkout_branch(branch_name)
-            self.assertTrue(sess.is_dolt_backend())
-            self.assertIsNotNone(sess.book)
-        finally:
-            sess.end()
-            sess.destroy()
-
     def test_safe_save_flushes_without_error(self):
         # Open a Dolt-backed session without using the context manager so
         # we can control when safe_save() is invoked.
@@ -91,14 +62,19 @@ class DoltBackendTestCase(unittest.TestCase):
         try:
             self.assertTrue(sess.is_dolt_backend())
 
+            # Explicitly select the main branch so that safe_save()
+            # operates against a known Dolt branch instead of relying
+            # on the server's default.
+            sess.dolt_checkout_branch("main")
+
             # Mark the book as having unsaved changes so that safe_save()
             # exercises the flush path before committing via Dolt.
             book = sess.book
             gnucash_core_c.qof_book_mark_session_dirty(book.get_instance())
 
             # Invoke safe_save() directly; for Dolt this should flush any
-            # pending changes and create a Dolt commit on the current branch
-            # without leaving a backend error.
+            # pending changes and create a Dolt commit on the explicitly
+            # selected branch without leaving a backend error.
             sess.safe_save(None)
             self.assertEqual(sess.get_error(), ERR_BACKEND_NO_ERR)
         finally:

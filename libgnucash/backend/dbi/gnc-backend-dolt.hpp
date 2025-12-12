@@ -83,6 +83,13 @@ private:
     std::string m_default_author;
     std::string m_default_email;
 
+    /* Name of the Dolt branch that this backend has explicitly been
+     * switched to via dolt_checkout_branch(). When empty no branch has
+     * been selected and Dolt-specific write operations (safe_sync,
+     * dolt_add, dolt_commit) must refuse to proceed.
+     */
+    std::string m_current_branch;
+
     bool execute_dolt_call(const std::string& sql,
                            std::string& error_out);
 };
