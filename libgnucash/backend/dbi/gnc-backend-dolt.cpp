@@ -206,6 +206,9 @@ GncDoltBackend::dolt_commit(const std::string& message,
             << ", " << quote_string(ident);
     }
 
+    // Close the CALL DOLT_COMMIT( ... ) invocation.
+    sql << ")";
+
     if (!execute_dolt_call(sql.str(), error_out))
         return false;
 
