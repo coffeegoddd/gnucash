@@ -151,11 +151,42 @@ gchar**  gnc_dolt_list_branches(QofBackend* be);
 gboolean gnc_dolt_create_branch(QofBackend* be, const gchar* branch);
 gboolean gnc_dolt_checkout_branch(QofBackend* be, const gchar* branch);
 gboolean gnc_dolt_add(QofBackend* be);
+/* The C API returns gboolean and provides the commit hash via an out param.
+ *
+ * In Python, we want `gnc_dolt_commit(be, message, author, email)` to return
+ * the commit hash string (or None) and not require the out parameter.
+ *
+ * We keep the raw binding available as `gnc_dolt_commit_c(...)`.
+ */
+%rename(gnc_dolt_commit_c) gnc_dolt_commit;
 gboolean gnc_dolt_commit(QofBackend* be,
                          const gchar* message,
                          const gchar* author,
                          const gchar* email,
                          gchar** out_commit_hash);
+
+%inline %{
+#include <string.h> /* strdup */
+
+/* Python-friendly wrapper: returns commit hash (malloc'd) or NULL. */
+static char*
+gnc_dolt_commit_py(QofBackend* be,
+                   const char* message,
+                   const char* author,
+                   const char* email)
+{
+    gchar* hash = NULL;
+    gboolean ok = gnc_dolt_commit(be, message, author, email, &hash);
+    if (!ok || hash == NULL)
+        return NULL;
+    char* out = strdup(hash);
+    g_free(hash);
+    return out;
+}
+%}
+
+%newobject gnc_dolt_commit_py;
+%rename(gnc_dolt_commit) gnc_dolt_commit_py;
 
 %include <qofbook.h>
 
