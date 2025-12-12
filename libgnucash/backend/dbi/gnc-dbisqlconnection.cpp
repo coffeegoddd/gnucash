@@ -31,6 +31,7 @@
 #include <sstream>
 
 #include "gnc-dbisqlconnection.hpp"
+#include "gnc-backend-dolt.h"
 
 static QofLogModule log_module = G_LOG_DOMAIN;
 // gnc-dbiproviderimpl.hpp has templates that need log_module defined.
@@ -87,9 +88,16 @@ GncDbiSqlConnection::GncDbiSqlConnection (DbType type, QofBackend* qbe,
     m_conn_ok{true}, m_last_error{ERR_BACKEND_NO_ERR}, m_error_repeat{0},
     m_retry{false}, m_sql_savepoint{0}, m_readonly{false}
 {
+    /* For Dolt-backed sessions we disable DB-level locking entirely and rely
+     * on Dolt's own concurrency and branching semantics instead. The shared
+     * gnclock table used by other DBI backends doesn't provide meaningful
+     * protection in a versioned Dolt context and can leave behind stale lock
+     * rows across branches. */
+    const bool is_dolt_backend = m_qbe && gnc_dolt_backend_is_dolt(m_qbe);
+
     if (mode == SESSION_READ_ONLY)
         m_readonly = true;
-    else if (!lock_database(mode == SESSION_BREAK_LOCK))
+    else if (!is_dolt_backend && !lock_database(mode == SESSION_BREAK_LOCK))
         throw std::runtime_error("Failed to lock database!");
     if (!check_and_rollback_failed_save())
     {
@@ -254,7 +262,10 @@ GncDbiSqlConnection::~GncDbiSqlConnection()
 {
     if (m_conn)
     {
-        unlock_database();
+        /* Skip lock cleanup for Dolt-backed sessions; lock/unlock are disabled
+         * there so there is nothing to clear in gnclock. */
+        if (!(m_qbe && gnc_dolt_backend_is_dolt(m_qbe)))
+            unlock_database();
         dbi_conn_close(m_conn);
         m_conn = nullptr;
     }
