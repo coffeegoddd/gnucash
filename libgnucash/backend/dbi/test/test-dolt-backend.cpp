@@ -103,6 +103,11 @@ TEST_F(DoltBackendTest, SafeSaveFlushesAndCommitsWithoutPriorSave)
     ASSERT_NE(be, nullptr);
     ASSERT_TRUE(gnc_dolt_backend_is_dolt(be));
 
+    // Explicitly select the main branch so that safe_save() operates
+    // against a known Dolt branch instead of relying on the server's
+    // default; GncDoltBackend::safe_sync now requires this.
+    ASSERT_TRUE(gnc_dolt_checkout_branch(be, "main"));
+
     // Mark the book dirty to ensure safe_save() has something to flush.
     qof_book_mark_session_dirty(qof_session_get_book(session));
 
