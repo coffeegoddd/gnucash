@@ -1004,8 +1004,12 @@ def session_dolt_commit(self, message, author=None, email=None):
         author = ""
     if email is None:
         email = ""
-    commit_hash = gnucash_core_c.gnc_dolt_commit(be, message, author, email)
-    # SWIG will map gchar** out param to return value (str or None).
+    # Prefer the Python-friendly wrapper if present (some SWIG builds expose the
+    # underlying C API's out param as a required argument).
+    commit_fn = getattr(gnucash_core_c, "gnc_dolt_commit_py", None) or getattr(gnucash_core_c, "gnc_dolt_commit", None)
+    if commit_fn is None:
+        raise AttributeError("gnc_dolt_commit not available in gnucash_core_c")
+    commit_hash = commit_fn(be, message, author, email)
     return commit_hash
 
 Session.is_dolt_backend = _is_dolt_backend
