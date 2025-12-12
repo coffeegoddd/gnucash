@@ -243,30 +243,13 @@ void
 GncDoltBackend::safe_sync(QofBook* book)
 {
     /*
-     * For Dolt-backed stores we want safe_sync() to guarantee that any
-     * in-memory changes are both flushed to the SQL working set and
-     * committed to the current Dolt branch.
+     * For Dolt-backed stores we want safe_sync() to safely flush any
+     * in-memory changes to the database working set.
      *
-     * Earlier revisions of this backend assumed that callers such as
-     * diffcash would always invoke Session.save() before safe_save(),
-     * so the book was already synced and safe_sync() only needed to
-     * perform DOLT_ADD/DOLT_COMMIT. That assumption doesn't hold for
-     * generic callers that only ever use qof_session_safe_save(), in
-     * which case changes might never be written to the database.
-     *
-     * To make safe_sync() self-contained while still avoiding the
-     * MySQL-specific index juggling that Dolt may reject (see
-     * GncDbiBackend<DbType::DBI_MYSQL>::safe_sync), we:
-     *
-     *   1. If the QofBook is dirty, flush it to the SQL working set
-     *      using the generic SQL backend's sync() implementation.
-     *   2. If auto-commit is enabled, stage and commit the resulting
-     *      working set via DOLT_ADD + DOLT_COMMIT.
-     *
-     * This ensures that qof_session_safe_save() alone is sufficient
-     * to persist and commit changes for Dolt-backed sessions, while
-     * still allowing advanced callers to disable auto-commit and
-     * manage Dolt commits explicitly.
+     * IMPORTANT: This function intentionally does NOT create Dolt
+     * commits. Callers that want to record history must explicitly
+     * invoke the Dolt primitives (DOLT_ADD / DOLT_COMMIT) via the
+     * exposed backend APIs.
      */
 
     /* Require callers to have explicitly selected a Dolt branch via
@@ -293,40 +276,9 @@ GncDoltBackend::safe_sync(QofBook* book)
 
         if (check_error())
         {
-            // Propagate SQL-level errors to the caller; do not attempt
-            // to stage or commit via Dolt if the flush failed.
+            // Propagate SQL-level errors to the caller.
             return;
         }
-    }
-
-    // If auto-commit is disabled, do nothing; callers control commit behavior.
-    if (!m_auto_commit)
-        return;
-
-    // Stage and commit all changes via Dolt.
-    std::string error;
-    if (!dolt_add(error))
-    {
-        if (!error.empty())
-            set_message(std::move(error));
-        // Mark an error but keep the DB changes; Dolt commit failed.
-        set_error(ERR_BACKEND_SERVER_ERR);
-        return;
-    }
-
-    std::string commit_hash;
-    error.clear();
-
-    auto author = m_default_author;
-    auto email  = m_default_email;
-
-    if (!dolt_commit("Automatic commit from GnuCash", author, email,
-                     commit_hash, error))
-    {
-        if (!error.empty())
-            set_message(std::move(error));
-        set_error(ERR_BACKEND_SERVER_ERR);
-        return;
     }
 }
 

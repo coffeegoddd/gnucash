@@ -90,7 +90,7 @@ TEST_F(DoltBackendTest, BranchOperations)
     qof_session_destroy(session);
 }
 
-TEST_F(DoltBackendTest, SafeSaveFlushesAndCommitsWithoutPriorSave)
+TEST_F(DoltBackendTest, SafeSaveFlushesWithoutError)
 {
     auto book = qof_book_new();
     auto session = qof_session_new(book);
@@ -111,9 +111,10 @@ TEST_F(DoltBackendTest, SafeSaveFlushesAndCommitsWithoutPriorSave)
     // Mark the book dirty to ensure safe_save() has something to flush.
     qof_book_mark_session_dirty(qof_session_get_book(session));
 
-    // Call safe_save() directly; for Dolt this should flush any pending
-    // changes and create a Dolt commit on the explicitly selected
-    // branch.
+    // Call safe_save() directly; for Dolt this should safely flush any
+    // pending changes into the working set on the explicitly selected
+    // branch. Creating Dolt commits is an explicit caller operation and
+    // is not performed by safe_save().
     qof_session_safe_save(session, nullptr);
     EXPECT_EQ(qof_session_get_error(session), ERR_BACKEND_NO_ERR);
 

@@ -68,12 +68,13 @@ class DoltBackendTestCase(unittest.TestCase):
             sess.dolt_checkout_branch("main")
 
             # Mark the book as having unsaved changes so that safe_save()
-            # exercises the flush path before committing via Dolt.
+            # exercises the flush path (safe_save does not create Dolt
+            # commits; callers must explicitly dolt_add/dolt_commit).
             book = sess.book
             gnucash_core_c.qof_book_mark_session_dirty(book.get_instance())
 
             # Invoke safe_save() directly; for Dolt this should flush any
-            # pending changes and create a Dolt commit on the explicitly
+            # pending changes to the working set on the explicitly
             # selected branch without leaving a backend error.
             sess.safe_save(None)
             self.assertEqual(sess.get_error(), ERR_BACKEND_NO_ERR)

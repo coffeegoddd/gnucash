@@ -70,19 +70,7 @@ public:
                 std::string& new_commit_hash_out,
                 std::string& error_out) override;
 
-    void set_auto_commit(bool enabled) noexcept { m_auto_commit = enabled; }
-    void set_default_author(const std::string& author,
-                            const std::string& email)
-    {
-        m_default_author = author;
-        m_default_email = email;
-    }
-
 private:
-    bool m_auto_commit { true };
-    std::string m_default_author;
-    std::string m_default_email;
-
     /* Name of the Dolt branch that this backend has explicitly been
      * switched to via dolt_checkout_branch(). When empty no branch has
      * been selected and Dolt-specific write operations (safe_sync,
