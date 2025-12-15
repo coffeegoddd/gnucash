@@ -6,6 +6,7 @@ set (backend_dbi_SOURCES
   gnc-backend-dbi.cpp
   gnc-dbisqlresult.cpp
   gnc-dbisqlconnection.cpp
+  gnc-backend-dolt.cpp
 )
 set (backend_dbi_noinst_HEADERS
   gnc-backend-dbi.h
@@ -14,6 +15,7 @@ set (backend_dbi_noinst_HEADERS
   gnc-dbisqlconnection.hpp
   gnc-dbiprovider.hpp
   gnc-dbiproviderimpl.hpp
+  gnc-backend-dolt.hpp
 )
 
 set_local_dist(backend_dbi_DIST_local

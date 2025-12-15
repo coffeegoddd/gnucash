@@ -33,6 +33,7 @@ set(GNUCASH_CORE_C_INCLUDES
     ${CMAKE_SOURCE_DIR}/libgnucash/engine/gncIDSearch.h
     ${CMAKE_SOURCE_DIR}/libgnucash/engine/gnc-pricedb.h
     ${CMAKE_SOURCE_DIR}/libgnucash/app-utils/gnc-prefs-utils.h
+    ${CMAKE_SOURCE_DIR}/libgnucash/backend/dbi
 )
 
 gnc_add_swig_python_command (swig-gnucash-core
@@ -69,6 +70,7 @@ if(WITH_PYTHON)
   set(gnucash_core_c_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/libgnucash
     ${CMAKE_SOURCE_DIR}/libgnucash/engine
+    ${CMAKE_SOURCE_DIR}/libgnucash/backend/dbi
     ${CMAKE_SOURCE_DIR}/gnucash/gnome-utils
     ${CMAKE_SOURCE_DIR}/libgnucash/app-utils
     ${CMAKE_SOURCE_DIR}/gnucash/gnome
@@ -79,7 +81,12 @@ if(WITH_PYTHON)
   add_library(gnucash_core_c MODULE ${SWIG_GNUCASH_CORE_C})
   target_include_directories(gnucash_core_c PRIVATE ${gnucash_core_c_INCLUDE_DIRS})
 
-  target_link_libraries(gnucash_core_c gnc-app-utils gnc-engine ${Python3_LIBRARIES})
+  target_link_libraries(gnucash_core_c
+    gnc-app-utils
+    gnc-engine
+    $<$<TARGET_EXISTS:gncmod-backend-dbi>:gncmod-backend-dbi>
+    ${Python3_LIBRARIES}
+  )
   set_target_properties(gnucash_core_c PROPERTIES PREFIX "_")
   target_compile_options(gnucash_core_c PRIVATE -Wno-implicit -Wno-missing-prototypes -Wno-declaration-after-statement -Wno-missing-declarations)
   if (HAVE_STRINGOP_TRUNCATION)

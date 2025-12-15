@@ -70,6 +70,7 @@
 #include <gnc-sql-object-backend.hpp>
 #include "gnc-dbisqlresult.hpp"
 #include "gnc-dbisqlconnection.hpp"
+#include "gnc-backend-dolt.hpp"
 
 #if LIBDBI_VERSION >= 900
 #define HAVE_LIBDBI_R 1
@@ -104,11 +105,41 @@ public:
     QofDbiBackendProvider(QofDbiBackendProvider&&) = delete;
     QofDbiBackendProvider operator=(QofDbiBackendProvider&&) = delete;
     ~QofDbiBackendProvider () = default;
-    QofBackend* create_backend(void)
+    QofBackend* create_backend(void) override
     {
         return new GncDbiBackend<Type>(nullptr, nullptr);
     }
-    bool type_check(const char* type) { return true; }
+    bool type_check(const char* type) override { return type != nullptr; }
+};
+
+/**
+ * Dolt backend provider.
+ *
+ * Registers GncDoltBackend under the \"dolt\" access method so that
+ * URIs like dolt://user:password@host/dbname select this backend.
+ */
+class QofDoltBackendProvider : public QofBackendProvider
+{
+public:
+    QofDoltBackendProvider(const char* name, const char* type) :
+        QofBackendProvider{name, type} {}
+    QofDoltBackendProvider(QofDoltBackendProvider&) = delete;
+    QofDoltBackendProvider operator=(QofDoltBackendProvider&) = delete;
+    QofDoltBackendProvider(QofDoltBackendProvider&&) = delete;
+    QofDoltBackendProvider operator=(QofDoltBackendProvider&&) = delete;
+    ~QofDoltBackendProvider() = default;
+
+    QofBackend* create_backend(void) override
+    {
+        return new GncDoltBackend(nullptr, nullptr);
+    }
+
+    bool type_check(const char* uri) override
+    {
+        // For now accept any dolt:// URI; connection errors will be
+        // reported by the underlying DBI layer.
+        return uri != nullptr;
+    }
 };
 
 /* ================================================================= */
@@ -139,12 +170,24 @@ UriStrings::UriStrings(const std::string& uri)
     m_protocol = std::string{scheme};
     m_host = std::string{host};
     if (dbname)
-	m_dbname = std::string{dbname};
+        m_dbname = std::string{dbname};
     if (username)
         m_username = std::string{username};
     if (password)
         m_password = std::string{password};
     m_portnum = portnum;
+
+    /* Trace how URIs are parsed into DB connection components so we can
+     * correlate test environment variables (like TEST_DOLT_URL) with the
+     * actual database name and host that libdbi will see. */
+    PINFO ("UriStrings: uri='%s' protocol='%s' host='%s' port=%d dbname='%s' user='%s'",
+           uri.c_str(),
+           m_protocol.c_str(),
+           m_host.c_str(),
+           m_portnum,
+           m_dbname.c_str(),
+           m_username.c_str());
+
     g_free(scheme);
     g_free(host);
     g_free(username);
@@ -211,6 +254,16 @@ GncDbiBackend<Type>::set_standard_connection_options (dbi_conn conn,
     options.push_back(std::make_pair("username", uri.m_username));
     options.push_back(std::make_pair("password", uri.m_password));
     options.push_back(std::make_pair("encoding", "UTF-8"));
+
+    /* Log the canonical connection options (especially dbname) that we pass
+     * into libdbi for easier correlation with server-side logs in tests. */
+    PINFO ("set_standard_connection_options: Type=%d host='%s' dbname='%s' user='%s' port=%d",
+           static_cast<int>(Type),
+           uri.m_host.c_str(),
+           uri.m_dbname.c_str(),
+           uri.m_username.c_str(),
+           uri.m_portnum);
+
     try
     {
         set_options(conn, options);
@@ -347,6 +400,17 @@ error_handler<DbType::DBI_SQLITE> (dbi_conn conn, void* user_data)
      * testing for the return value of the seek.
      */
     if (err_num == DBI_ERROR_BADIDX) return;
+
+    /* Dolt reports "nothing to commit" as a generic MySQL error 1105.
+     * When this happens in response to a CALL DOLT_COMMIT() with no
+     * staged changes it's a benign condition and should not be treated
+     * as a backend error. Detect that specific message and ignore it.
+     */
+    if (err_num == 1105 && msg && g_strrstr(msg, "nothing to commit"))
+    {
+        PINFO ("Ignoring benign Dolt commit error: %s\n", msg);
+        return;
+    }
     PERR ("DBI error: %s\n", msg);
     if (dbi_be->connected())
         dbi_be->set_dbi_error (ERR_BACKEND_MISC, 0, false);
@@ -467,6 +531,16 @@ error_handler<DbType::DBI_MYSQL> (dbi_conn conn, void* user_data)
     const char* msg;
 
     auto err_num = dbi_conn_error (conn, &msg);
+
+    /* Provide additional context for MySQL/Dolt errors by logging the current
+     * dbname option as seen by libdbi. This is especially helpful when
+     * tracking down tests that accidentally connect to the wrong database. */
+    const char* current_db = dbi_conn_get_option (conn, "dbname");
+    PINFO ("MySQL DBI error handler: err_num=%d dbname='%s' message='%s'",
+           err_num,
+           current_db ? current_db : "(null)",
+           msg ? msg : "(null)");
+
     /* BADIDX is raised if we attempt to seek outside of a result. We
      * handle that possibility after checking the return value of the
      * seek. Having this raise a critical error breaks looping by
@@ -1162,8 +1236,16 @@ gnc_module_init_backend_dbi (void)
     if (have_mysql_driver)
     {
         const char *name = "GnuCash Libdbi (MYSQL) Backend";
-        auto prov = QofBackendProvider_ptr(new QofDbiBackendProvider<DbType::DBI_MYSQL>{name, "mysql"});
+        auto prov = QofBackendProvider_ptr(
+            new QofDbiBackendProvider<DbType::DBI_MYSQL>{name, "mysql"});
         qof_backend_register_provider(std::move(prov));
+
+        /* Also register the Dolt backend, which builds on the MySQL
+         * DBI driver but exposes Dolt-specific functionality. */
+        const char *dolt_name = "GnuCash Dolt (MySQL) Backend";
+        auto dolt_prov = QofBackendProvider_ptr(
+            new QofDoltBackendProvider{dolt_name, "dolt"});
+        qof_backend_register_provider(std::move(dolt_prov));
     }
 
     if (have_pgsql_driver)

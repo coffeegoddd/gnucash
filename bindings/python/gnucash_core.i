@@ -82,6 +82,7 @@
 #include "gnc-prefs-utils.h"
 #include "cap-gains.h"
 #include "Scrub3.h"
+#include "gnc-backend-dolt.h"
 %}
 
 %include <time64.i>
@@ -96,6 +97,96 @@
 // ignored because SWIG attempts to link against (to create language bindings)
 %ignore qof_session_not_saved;
 %include <qofsession.h>
+
+/* SWIG typemap: convert gchar** branch lists to Python lists of str.
+ *
+ * gnc_dolt_list_branches allocates a NULL-terminated gchar** vector that
+ * must be freed by the caller via g_strfreev. Without this typemap SWIG
+ * exposes the return value as an opaque SwigPyObject which is not iterable
+ * from Python code. This typemap makes the function behave as expected in
+ * gnucash_core.py: a list[str] (or [] when no branches exist).
+ */
+%typemap(out) gchar ** {
+    if ($1 == NULL)
+    {
+        $result = PyList_New(0);
+    }
+    else
+    {
+        PyObject *lst = PyList_New(0);
+        if (!lst)
+        {
+            g_strfreev($1);
+            SWIG_fail;
+        }
+
+        gchar **p = $1;
+        while (*p != NULL)
+        {
+            PyObject *s = PyUnicode_FromString(*p);
+            if (!s)
+            {
+                g_strfreev($1);
+                Py_DECREF(lst);
+                SWIG_fail;
+            }
+            PyList_Append(lst, s);
+            Py_DECREF(s);
+            ++p;
+        }
+
+        g_strfreev($1);
+        $result = lst;
+    }
+}
+
+/* Dolt backend C API: declare only the functions we need for Python.
+ * The C implementation is provided by gnc-backend-dolt.h/cpp included above.
+ *
+ * IMPORTANT: The typemap above must appear before this declaration so SWIG
+ * applies it to the function return type.
+ */
+gboolean gnc_dolt_backend_is_dolt(QofBackend* be);
+gchar**  gnc_dolt_list_branches(QofBackend* be);
+gboolean gnc_dolt_create_branch(QofBackend* be, const gchar* branch);
+gboolean gnc_dolt_checkout_branch(QofBackend* be, const gchar* branch);
+gboolean gnc_dolt_add(QofBackend* be);
+/* The C API returns gboolean and provides the commit hash via an out param.
+ *
+ * In Python, we want `gnc_dolt_commit(be, message, author, email)` to return
+ * the commit hash string (or None) and not require the out parameter.
+ *
+ * We keep the raw binding available as `gnc_dolt_commit_c(...)`.
+ */
+%rename(gnc_dolt_commit_c) gnc_dolt_commit;
+gboolean gnc_dolt_commit(QofBackend* be,
+                         const gchar* message,
+                         const gchar* author,
+                         const gchar* email,
+                         gchar** out_commit_hash);
+
+%inline %{
+#include <string.h> /* strdup */
+
+/* Python-friendly wrapper: returns commit hash (malloc'd) or NULL. */
+static char*
+gnc_dolt_commit_py(QofBackend* be,
+                   const char* message,
+                   const char* author,
+                   const char* email)
+{
+    gchar* hash = NULL;
+    gboolean ok = gnc_dolt_commit(be, message, author, email, &hash);
+    if (!ok || hash == NULL)
+        return NULL;
+    char* out = strdup(hash);
+    g_free(hash);
+    return out;
+}
+%}
+
+%newobject gnc_dolt_commit_py;
+%rename(gnc_dolt_commit) gnc_dolt_commit_py;
 
 %include <qofbook.h>
 

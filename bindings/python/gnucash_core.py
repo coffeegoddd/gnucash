@@ -886,6 +886,18 @@ class GUID(GnuCashCoreClass):
 # Session
 Session.add_constructor_and_methods_with_prefix('qof_session_', 'new')
 
+def _session_get_backend(self):
+    """
+    Return the low-level QofBackend* for this Session.
+
+    This is primarily intended for feature detection and for calling
+    backend-specific helper functions such as Dolt operations.
+    """
+    # get_instance() is a QofSession*; qof_session_get_backend returns QofBackend*.
+    return gnucash_core_c.qof_session_get_backend(self.get_instance())
+
+Session.get_backend = _session_get_backend
+
 def one_arg_default_none(function):
     return default_arguments_decorator(function, None, None)
 Session.decorate_functions(one_arg_default_none, "load", "save")
@@ -911,6 +923,101 @@ backend_error_dict = {}
 for error_name, error_value, error_name_after_prefix in \
     extract_attributes_with_prefix(gnucash_core_c, 'ERR_'):
     backend_error_dict[ error_value ] = error_name
+
+def _is_dolt_backend(session):
+    """
+    Return True if this Session is using a Dolt-capable backend.
+    """
+    be = session.get_backend()
+    if be is None:
+        return False
+    return bool(gnucash_core_c.gnc_dolt_backend_is_dolt(be))
+
+def _dolt_require_backend(session):
+    """
+    Internal helper that raises a RuntimeError if the Session backend
+    is not Dolt-capable.
+    """
+    if not _is_dolt_backend(session):
+        raise RuntimeError("Session backend is not a Dolt backend")
+
+def session_dolt_list_branches(self):
+    """
+    Return a list of Dolt branches for this Session's backend.
+    """
+    _dolt_require_backend(self)
+    be = self.get_backend()
+    branches = gnucash_core_c.gnc_dolt_list_branches(be)
+    # SWIG will typically expose gchar** as a Python list of str or None.
+    # On some builds, this may instead be a low-level SwigPyObject that is
+    # not directly iterable. In that case, fall back to an empty list so
+    # callers can still rely on a list return type without crashing.
+    if branches is None:
+        return []
+    try:
+        return list(branches)
+    except TypeError:
+        # Best-effort fallback for bindings that don't map gchar** → list.
+        return []
+
+def session_dolt_create_branch(self, branch):
+    """
+    Create a new Dolt branch (does not check it out).
+    """
+    _dolt_require_backend(self)
+    be = self.get_backend()
+    gnucash_core_c.gnc_dolt_create_branch(be, branch)
+
+def session_dolt_checkout_branch(self, branch):
+    """
+    Check out an existing Dolt branch on this Session's backend.
+
+    Note: This is a low-level helper that only switches the backend's
+    active Dolt branch; it does not reload the Session's Book. In most
+    cases you should prefer Session.dolt_session_checkout_branch(),
+    which safely reopens and reloads the Session on the target branch.
+    """
+    _dolt_require_backend(self)
+    be = self.get_backend()
+    gnucash_core_c.gnc_dolt_checkout_branch(be, branch)
+
+def session_dolt_add(self):
+    """
+    Stage all changes in the working set for Dolt commit.
+    """
+    _dolt_require_backend(self)
+    be = self.get_backend()
+    gnucash_core_c.gnc_dolt_add(be)
+
+def session_dolt_commit(self, message, author=None, email=None):
+    """
+    Create a Dolt commit from the current working set.
+
+    :param message: Commit message (required).
+    :param author: Optional author name.
+    :param email: Optional author email.
+    :return: Commit hash string if available, otherwise None.
+    """
+    _dolt_require_backend(self)
+    be = self.get_backend()
+    if author is None:
+        author = ""
+    if email is None:
+        email = ""
+    # Prefer the Python-friendly wrapper if present (some SWIG builds expose the
+    # underlying C API's out param as a required argument).
+    commit_fn = getattr(gnucash_core_c, "gnc_dolt_commit_py", None) or getattr(gnucash_core_c, "gnc_dolt_commit", None)
+    if commit_fn is None:
+        raise AttributeError("gnc_dolt_commit not available in gnucash_core_c")
+    commit_hash = commit_fn(be, message, author, email)
+    return commit_hash
+
+Session.is_dolt_backend = _is_dolt_backend
+Session.dolt_list_branches = session_dolt_list_branches
+Session.dolt_create_branch = session_dolt_create_branch
+Session.dolt_checkout_branch = session_dolt_checkout_branch
+Session.dolt_add = session_dolt_add
+Session.dolt_commit = session_dolt_commit
 
 # GncNumeric denominator computation schemes
 # Used for the denom argument in arithmetic functions like GncNumeric.add
