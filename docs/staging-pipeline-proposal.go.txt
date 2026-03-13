@@ -1,0 +1,703 @@
+// Package staging defines Go interfaces and SQL table schemas for a raw
+// financial data staging pipeline that sits between bank downloads and
+// double-entry ledger posting.
+//
+// This file is a design proposal — not compilable production code. It captures
+// the staging layer needed for agent-driven accounting in cashchat, where an AI
+// agent downloads raw transaction data, stages it, then reviews, categorizes,
+// and posts entries into the double-entry ledger.
+//
+// ## Design Principles
+//
+//  1. Durable staging — raw data persists in Dolt SQL tables, not just memory.
+//  2. Source-agnostic — adapters normalize heterogeneous bank formats (Chase CSV,
+//     Cash App JSON, OFX, PDF statements) into a common staging record.
+//  3. Lifecycle tracking — every staged record progresses through a state machine:
+//     staged → matched → posted → reconciled (or rejected at any point).
+//  4. Deduplication — unique constraint on (source_system, external_id, account_id)
+//     prevents reimporting the same transaction.
+//  5. Incremental imports — add new data without re-importing everything; import
+//     sessions track what has already been ingested.
+//  6. Match scoring — inspired by GnuCash's import-backend.cpp heuristics, scores
+//     candidate matches by amount, date proximity, and description similarity.
+//  7. Agent-friendly — all operations are queryable/actionable via SQL or Go
+//     interfaces so an AI agent can list, categorize, approve, and post.
+//
+// ## Relationship to the Ledger
+//
+// The staging layer references types from the accounting package
+// (docs/go-interfaces-proposal.go.txt) but does NOT modify ledger state
+// directly. Posting is the bridge: a staged record becomes a Transaction+Splits
+// in the ledger only when explicitly posted through the Pipeline interface.
+//
+// ## Derived From
+//
+// GnuCash's import-export system (gnucash/import-export/):
+//   - import-backend.h/cpp: GNCImportTransInfo, GNCImportMatchInfo, match scoring
+//   - import-settings.cpp: threshold configuration (add, clear, display, date)
+//   - import-pending-matches.cpp: conflict resolution for competing matches
+//   - import-main-matcher.cpp: greedy conflict resolution algorithm
+//   - import-utilities.h: online_id deduplication
+//   - Format-specific importers: OFX, CSV, QIF, AQBanking adapters
+package staging
+
+import (
+	"context"
+	"io"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Re-use foundational types from the accounting package.
+type ID = uuid.UUID
+type Numeric = struct {
+	Num   int64
+	Denom int64
+}
+
+// ---------------------------------------------------------------------------
+// Import Session — tracks each import operation
+// ---------------------------------------------------------------------------
+
+// ImportSession records a single import operation: which source, when, what
+// file, and how many records were ingested. This enables incremental imports
+// and audit trails.
+//
+// SQL table: import_sessions
+//
+//	CREATE TABLE import_sessions (
+//	    id            VARCHAR(36) PRIMARY KEY,
+//	    source_system VARCHAR(64)  NOT NULL,  -- e.g. "chase", "cashapp", "ofx"
+//	    account_id    VARCHAR(36)  NOT NULL,  -- target account in ledger
+//	    filename      VARCHAR(512),           -- original filename or URL
+//	    file_hash     VARCHAR(64),            -- SHA-256 of source file (dedup whole files)
+//	    format        VARCHAR(32)  NOT NULL,  -- "csv", "ofx", "qfx", "json", "pdf"
+//	    started_at    DATETIME     NOT NULL,
+//	    completed_at  DATETIME,
+//	    record_count  INT          DEFAULT 0, -- how many records were staged
+//	    status        VARCHAR(16)  NOT NULL DEFAULT 'in_progress',
+//	                                          -- in_progress | completed | failed
+//	    error_message TEXT,                   -- if status = failed
+//	    metadata      JSON,                   -- source-specific context (bank name, date range, etc.)
+//	    UNIQUE(file_hash, account_id)         -- prevent reimporting same file to same account
+//	);
+type ImportSession struct {
+	ID           ID
+	SourceSystem string    // normalized source identifier
+	AccountID    ID        // target ledger account
+	Filename     string    // original file path or URL
+	FileHash     string    // SHA-256 of raw file content
+	Format       string    // file format
+	StartedAt    time.Time
+	CompletedAt  *time.Time
+	RecordCount  int
+	Status       ImportSessionStatus
+	ErrorMessage string
+	Metadata     map[string]any // source-specific context
+}
+
+type ImportSessionStatus string
+
+const (
+	ImportSessionInProgress ImportSessionStatus = "in_progress"
+	ImportSessionCompleted  ImportSessionStatus = "completed"
+	ImportSessionFailed     ImportSessionStatus = "failed"
+)
+
+// ---------------------------------------------------------------------------
+// Staged Record — raw imported data before ledger posting
+// ---------------------------------------------------------------------------
+
+// StagedRecordStatus is the lifecycle state of a staged record.
+//
+// State machine:
+//
+//	                ┌──────────┐
+//	                │  staged  │  (initial state after import)
+//	                └────┬─────┘
+//	                     │
+//	           ┌─────────┼──────────┐
+//	           ▼         ▼          ▼
+//	      ┌────────┐ ┌────────┐ ┌──────────┐
+//	      │matched │ │rejected│ │ duplicate│
+//	      └───┬────┘ └────────┘ └──────────┘
+//	          │
+//	          ▼
+//	      ┌────────┐
+//	      │ posted │  (ledger transaction created)
+//	      └───┬────┘
+//	          │
+//	          ▼
+//	      ┌───────────┐
+//	      │reconciled │  (bank statement matched)
+//	      └───────────┘
+type StagedRecordStatus string
+
+const (
+	StatusStaged     StagedRecordStatus = "staged"     // imported, awaiting review
+	StatusMatched    StagedRecordStatus = "matched"    // matched to existing txn or categorized
+	StatusRejected   StagedRecordStatus = "rejected"   // agent/user rejected this record
+	StatusDuplicate  StagedRecordStatus = "duplicate"  // detected as duplicate of existing record
+	StatusPosted     StagedRecordStatus = "posted"     // created as ledger transaction
+	StatusReconciled StagedRecordStatus = "reconciled" // reconciled with bank statement
+)
+
+// StagedRecord is a single raw transaction from an external source, stored
+// durably before being posted to the ledger. Each record preserves the original
+// data exactly as received, plus normalized fields for matching.
+//
+// SQL table: staged_records
+//
+//	CREATE TABLE staged_records (
+//	    id              VARCHAR(36) PRIMARY KEY,
+//	    session_id      VARCHAR(36) NOT NULL REFERENCES import_sessions(id),
+//	    source_system   VARCHAR(64) NOT NULL,
+//	    external_id     VARCHAR(256) NOT NULL, -- bank's transaction ID / reference
+//	    account_id      VARCHAR(36) NOT NULL,  -- target ledger account
+//
+//	    -- Normalized fields (adapter output)
+//	    date_posted     DATE         NOT NULL,
+//	    date_available  DATE,                   -- settlement/available date if different
+//	    amount          BIGINT       NOT NULL,  -- numerator (in account commodity)
+//	    amount_denom    BIGINT       NOT NULL DEFAULT 100,
+//	    description     VARCHAR(1024) NOT NULL,
+//	    memo            VARCHAR(1024),
+//	    check_number    VARCHAR(32),
+//	    reference       VARCHAR(256),           -- payee reference, transaction ref, etc.
+//	    tx_type         VARCHAR(32),            -- "debit", "credit", "transfer", "fee", etc.
+//	    currency        VARCHAR(3),             -- ISO 4217 code
+//
+//	    -- Raw preservation
+//	    raw_data        JSON NOT NULL,          -- exact original record (full fidelity)
+//	    raw_line_number INT,                    -- position in source file
+//
+//	    -- Lifecycle
+//	    status          VARCHAR(16)  NOT NULL DEFAULT 'staged',
+//	    status_reason   VARCHAR(256),           -- why rejected/duplicate
+//	    matched_txn_id  VARCHAR(36),            -- ledger transaction if posted/reconciled
+//	    matched_split_id VARCHAR(36),           -- specific split matched
+//	    dest_account_id VARCHAR(36),            -- categorized destination account
+//	    match_score     INT,                    -- match confidence (0-100)
+//
+//	    -- Agent interaction
+//	    category        VARCHAR(128),           -- agent-proposed category
+//	    agent_notes     TEXT,                   -- agent reasoning for categorization
+//	    reviewed_at     DATETIME,               -- when agent/user reviewed
+//	    posted_at       DATETIME,               -- when posted to ledger
+//	    reconciled_at   DATETIME,               -- when reconciled
+//
+//	    -- Timestamps
+//	    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//	    updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//
+//	    -- Deduplication
+//	    UNIQUE(source_system, external_id, account_id)
+//	);
+//
+//	-- Indexes for common queries
+//	CREATE INDEX idx_staged_status ON staged_records(status);
+//	CREATE INDEX idx_staged_account_date ON staged_records(account_id, date_posted);
+//	CREATE INDEX idx_staged_session ON staged_records(session_id);
+//	CREATE INDEX idx_staged_matched_txn ON staged_records(matched_txn_id);
+type StagedRecord struct {
+	ID           ID
+	SessionID    ID
+	SourceSystem string
+	ExternalID   string // bank's own transaction identifier
+	AccountID    ID     // target account in ledger
+
+	// Normalized fields (adapter output)
+	DatePosted    time.Time
+	DateAvailable *time.Time
+	Amount        Numeric // in account's commodity
+	Description   string
+	Memo          string
+	CheckNumber   string
+	Reference     string // payee reference
+	TxType        string // "debit", "credit", "transfer", "fee"
+	Currency      string // ISO 4217
+
+	// Raw preservation
+	RawData       map[string]any // original record, full fidelity
+	RawLineNumber int
+
+	// Lifecycle
+	Status        StagedRecordStatus
+	StatusReason  string
+	MatchedTxnID  *ID    // ledger transaction if posted
+	MatchedSplitID *ID   // specific split matched
+	DestAccountID *ID    // categorized destination account
+	MatchScore    int    // 0-100
+
+	// Agent interaction
+	Category   string
+	AgentNotes string
+	ReviewedAt *time.Time
+	PostedAt   *time.Time
+	ReconciledAt *time.Time
+
+	// Timestamps
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// ---------------------------------------------------------------------------
+// Match Candidate — potential matches between staged records and ledger
+// ---------------------------------------------------------------------------
+
+// MatchCandidate represents a potential match between a staged record and an
+// existing ledger transaction/split. Inspired by GnuCash's GNCImportMatchInfo.
+//
+// SQL table: match_candidates
+//
+//	CREATE TABLE match_candidates (
+//	    id              VARCHAR(36) PRIMARY KEY,
+//	    staged_id       VARCHAR(36) NOT NULL REFERENCES staged_records(id),
+//	    txn_id          VARCHAR(36) NOT NULL,  -- candidate ledger transaction
+//	    split_id        VARCHAR(36) NOT NULL,  -- candidate ledger split
+//	    score           INT         NOT NULL,  -- composite match score (0-100)
+//	    score_breakdown JSON        NOT NULL,  -- per-factor scores for transparency
+//	    is_selected     BOOLEAN     DEFAULT FALSE, -- agent/user chose this match
+//	    created_at      DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//
+//	    UNIQUE(staged_id, split_id)
+//	);
+//
+//	CREATE INDEX idx_match_staged ON match_candidates(staged_id);
+//	CREATE INDEX idx_match_score ON match_candidates(staged_id, score DESC);
+type MatchCandidate struct {
+	ID             ID
+	StagedID       ID  // which staged record
+	TxnID          ID  // candidate ledger transaction
+	SplitID        ID  // candidate ledger split
+	Score          int // composite score 0-100
+	ScoreBreakdown MatchScoreBreakdown
+	IsSelected     bool
+	CreatedAt      time.Time
+}
+
+// MatchScoreBreakdown provides transparency into how a match score was computed.
+// Each factor mirrors GnuCash's split_find_match() heuristics but is stored
+// explicitly so an agent can explain its reasoning.
+type MatchScoreBreakdown struct {
+	AmountScore      int    `json:"amount_score"`      // exact=30, fuzzy=20, mismatch=-50
+	DateScore        int    `json:"date_score"`        // exact=30, close=20, far=-50
+	DescriptionScore int    `json:"description_score"` // exact=20, fuzzy=10, none=0
+	MemoScore        int    `json:"memo_score"`        // exact=10, fuzzy=5, none=0
+	CheckNumScore    int    `json:"check_num_score"`   // exact=10, mismatch=-20
+	AmountDelta      string `json:"amount_delta"`      // human-readable difference
+	DateDelta        int    `json:"date_delta_days"`   // days between dates
+}
+
+// ---------------------------------------------------------------------------
+// Source Adapter — pluggable bank/financial data parsers
+// ---------------------------------------------------------------------------
+
+// SourceAdapter is the interface that format-specific importers implement.
+// Each adapter knows how to parse one bank/format combination and normalize
+// records into StagedRecords. This mirrors GnuCash's pattern where OFX, CSV,
+// QIF, and AQBanking each implement the same import contract.
+//
+// Adapters are stateless — they parse a stream and return normalized records.
+// The pipeline handles deduplication, storage, and lifecycle.
+type SourceAdapter interface {
+	// Name returns a unique identifier for this adapter (e.g. "chase-csv",
+	// "cashapp-json", "generic-ofx").
+	Name() string
+
+	// SourceSystem returns the normalized source system name used in
+	// staged_records.source_system (e.g. "chase", "cashapp", "ofx").
+	SourceSystem() string
+
+	// SupportedFormats returns the file formats this adapter can parse
+	// (e.g. ["csv"], ["ofx", "qfx"], ["json"]).
+	SupportedFormats() []string
+
+	// DetectFormat examines the first bytes of a file and reports whether
+	// this adapter can parse it, and with what confidence (0-100).
+	DetectFormat(header []byte) (canParse bool, confidence int)
+
+	// Parse reads raw financial data from r and returns normalized staged
+	// records. The accountID identifies the target ledger account.
+	// Each returned record has SourceSystem, ExternalID, and normalized
+	// fields populated; the caller assigns IDs and SessionID.
+	//
+	// Parse must preserve the original data in RawData for audit purposes.
+	Parse(ctx context.Context, r io.Reader, accountID ID) ([]*StagedRecord, error)
+}
+
+// ---------------------------------------------------------------------------
+// Match Scorer — pluggable match scoring strategies
+// ---------------------------------------------------------------------------
+
+// MatchScorer computes similarity scores between a staged record and existing
+// ledger splits. This is modeled after GnuCash's split_find_match() in
+// import-backend.cpp but abstracted as an interface so scoring strategies
+// can evolve (e.g. adding ML-based matching alongside heuristic scoring).
+type MatchScorer interface {
+	// Score computes a match score (0-100) between a staged record and an
+	// existing ledger split+transaction pair. Higher = more likely match.
+	Score(staged *StagedRecord, split *LedgerSplit) (int, MatchScoreBreakdown)
+}
+
+// LedgerSplit bundles a split with its parent transaction for match scoring.
+// This avoids requiring the scorer to make additional lookups.
+type LedgerSplit struct {
+	SplitID       ID
+	TxnID         ID
+	Amount        Numeric
+	DatePosted    time.Time
+	Description   string // from transaction
+	Memo          string // from split
+	CheckNumber   string // from transaction
+	AccountID     ID
+	ReconcileState byte // 'n', 'c', 'y', 'f', 'v'
+}
+
+// DefaultMatchThresholds mirrors GnuCash's import-settings.cpp defaults.
+// Scores map to actions:
+//   - score >= AutoClearThreshold → auto-match (CLEAR in gnucash terms)
+//   - score >= DisplayThreshold   → show as candidate
+//   - score < AutoAddThreshold    → treat as new (ADD in gnucash terms)
+type DefaultMatchThresholds struct {
+	AutoClearThreshold int // default: 70 (auto-reconcile)
+	AutoAddThreshold   int // default: 30 (treat as new transaction)
+	DisplayThreshold   int // default: 20 (show as match candidate)
+	DateHardLimitDays  int // default: 42 (discard matches beyond this)
+	FuzzyAmountCents   int // default: 0 (ATM fee tolerance)
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline — the orchestration interface for agent-driven import
+// ---------------------------------------------------------------------------
+
+// StagedRecordFilter defines query criteria for listing staged records.
+type StagedRecordFilter struct {
+	AccountID    *ID
+	Status       *StagedRecordStatus
+	SessionID    *ID
+	SourceSystem *string
+	DateFrom     *time.Time
+	DateTo       *time.Time
+	Limit        int
+	Offset       int
+}
+
+// Pipeline is the primary interface an agent uses to drive the import workflow.
+// It orchestrates the full lifecycle: import → stage → match → post → reconcile.
+type Pipeline interface {
+	// --- Import ---
+
+	// ImportFile creates an import session and runs the appropriate adapter
+	// to parse and stage records from a file. Returns the session and the
+	// count of newly staged records (excluding duplicates).
+	ImportFile(ctx context.Context, r io.Reader, filename string, accountID ID) (*ImportSession, int, error)
+
+	// RegisterAdapter adds a source adapter to the pipeline's registry.
+	// Adapters are tried in order of DetectFormat confidence.
+	RegisterAdapter(adapter SourceAdapter)
+
+	// --- Query staged records ---
+
+	// ListStaged returns staged records matching the filter.
+	ListStaged(ctx context.Context, filter StagedRecordFilter) ([]*StagedRecord, error)
+
+	// GetStaged returns a single staged record by ID.
+	GetStaged(ctx context.Context, id ID) (*StagedRecord, error)
+
+	// --- Matching ---
+
+	// FindMatches runs the match scorer against existing ledger splits for
+	// a staged record, stores candidates in match_candidates, and returns
+	// them ranked by score. If a high-confidence match is found, it
+	// auto-updates the staged record's status to "matched".
+	FindMatches(ctx context.Context, stagedID ID) ([]*MatchCandidate, error)
+
+	// FindMatchesBatch runs matching for all staged records in a session
+	// (or all records matching a filter). Returns the count of records
+	// that were auto-matched.
+	FindMatchesBatch(ctx context.Context, filter StagedRecordFilter) (int, error)
+
+	// SelectMatch explicitly selects a match candidate for a staged record.
+	// Sets the staged record to "matched" status with the selected candidate's
+	// transaction/split as the match.
+	SelectMatch(ctx context.Context, stagedID, candidateID ID) error
+
+	// --- Categorization (agent-driven) ---
+
+	// Categorize sets the destination account and category for a staged record.
+	// This is the agent's primary action: deciding which expense/income account
+	// a raw transaction maps to.
+	Categorize(ctx context.Context, stagedID ID, destAccountID ID, category string, notes string) error
+
+	// --- Posting (staged → ledger) ---
+
+	// Post creates a ledger transaction from a staged record. The staged record
+	// must have a destination account set. Creates a Transaction with two splits:
+	// one in the source account (from staged_record.account_id) and one in the
+	// destination account (from staged_record.dest_account_id).
+	// Updates status to "posted" and records matched_txn_id.
+	Post(ctx context.Context, stagedID ID) (*ID, error)
+
+	// PostBatch posts all matched/categorized staged records in a session.
+	// Returns the count of successfully posted records.
+	PostBatch(ctx context.Context, filter StagedRecordFilter) (int, error)
+
+	// --- Reconciliation ---
+
+	// Reconcile marks a posted staged record as reconciled. This sets the
+	// corresponding split's reconcile state to 'y' (reconciled) in the ledger.
+	Reconcile(ctx context.Context, stagedID ID) error
+
+	// --- Rejection ---
+
+	// Reject marks a staged record as rejected with a reason. Rejected records
+	// are excluded from matching and posting but preserved for audit.
+	Reject(ctx context.Context, stagedID ID, reason string) error
+
+	// --- Import history ---
+
+	// ListSessions returns import sessions, most recent first.
+	ListSessions(ctx context.Context, limit, offset int) ([]*ImportSession, error)
+
+	// GetSession returns a single import session by ID.
+	GetSession(ctx context.Context, id ID) (*ImportSession, error)
+}
+
+// ---------------------------------------------------------------------------
+// Heuristic Match Scorer — default implementation spec
+// ---------------------------------------------------------------------------
+
+// HeuristicScorer is the specification for the default match scorer,
+// directly inspired by GnuCash's split_find_match() in import-backend.cpp.
+//
+// The scoring algorithm works as follows:
+//
+// ## Amount Matching (max 30 points)
+//   - Exact match (after sign normalization): +30
+//   - Within fuzzy threshold (ATM fee tolerance): +20
+//   - Outside threshold: -50 (strong negative signal)
+//
+// ## Date Matching (max 30 points)
+//   - Same day: +30
+//   - Within date_threshold (default 7 days): +20
+//   - Within date_not_threshold (default 14 days): +10
+//   - Beyond date_not_threshold: -50
+//   - Beyond date_hard_limit (default 42 days): candidate discarded entirely
+//
+// ## Description Matching (max 20 points)
+//   - Exact match (case-insensitive): +20
+//   - Prefix match (first 50% of string): +10
+//   - Token overlap (Jaccard similarity > 0.5): +5
+//   - No match: 0
+//
+// ## Memo Matching (max 10 points)
+//   - Exact match: +10
+//   - Prefix/fuzzy match: +5
+//   - No match: 0
+//
+// ## Check/Reference Number (max 10 points)
+//   - Exact numeric match: +10
+//   - Both present, non-matching: -20
+//   - One or both absent: 0
+//
+// ## Final Score
+//   - Sum all factors, clamp to [0, 100]
+//   - Store per-factor breakdown for agent transparency
+//
+// ## Conflict Resolution (from GnuCash's resolve_conflicts)
+//   - When multiple staged records match the same ledger transaction:
+//     1. Keep the match for the staged record with the highest score
+//     2. Remove that candidate from all other staged records
+//     3. Repeat until no conflicts remain
+//   - This greedy algorithm guarantees termination since each iteration
+//     removes at least one match from a finite candidate pool.
+type HeuristicScorer struct {
+	DateThreshold     int // days for "likely" match (default 7)
+	DateNotThreshold  int // days for "unlikely" match (default 14)
+	DateHardLimit     int // days beyond which to discard (default 42)
+	FuzzyAmountCents  int // ATM fee tolerance in cents (default 0)
+}
+
+// ---------------------------------------------------------------------------
+// SQL Schema — complete DDL for the staging layer
+// ---------------------------------------------------------------------------
+//
+// All tables are designed for Dolt (MySQL-compatible DDL). The staging layer
+// is stored in the same Dolt database as the ledger tables from the accounting
+// package.
+//
+// ## Full DDL
+//
+//  CREATE TABLE import_sessions (
+//      id            VARCHAR(36) PRIMARY KEY,
+//      source_system VARCHAR(64)  NOT NULL,
+//      account_id    VARCHAR(36)  NOT NULL,
+//      filename      VARCHAR(512),
+//      file_hash     VARCHAR(64),
+//      format        VARCHAR(32)  NOT NULL,
+//      started_at    DATETIME     NOT NULL,
+//      completed_at  DATETIME,
+//      record_count  INT          DEFAULT 0,
+//      status        VARCHAR(16)  NOT NULL DEFAULT 'in_progress',
+//      error_message TEXT,
+//      metadata      JSON,
+//      UNIQUE(file_hash, account_id)
+//  );
+//
+//  CREATE TABLE staged_records (
+//      id               VARCHAR(36) PRIMARY KEY,
+//      session_id       VARCHAR(36) NOT NULL,
+//      source_system    VARCHAR(64) NOT NULL,
+//      external_id      VARCHAR(256) NOT NULL,
+//      account_id       VARCHAR(36) NOT NULL,
+//      date_posted      DATE         NOT NULL,
+//      date_available   DATE,
+//      amount           BIGINT       NOT NULL,
+//      amount_denom     BIGINT       NOT NULL DEFAULT 100,
+//      description      VARCHAR(1024) NOT NULL,
+//      memo             VARCHAR(1024),
+//      check_number     VARCHAR(32),
+//      reference        VARCHAR(256),
+//      tx_type          VARCHAR(32),
+//      currency         VARCHAR(3),
+//      raw_data         JSON         NOT NULL,
+//      raw_line_number  INT,
+//      status           VARCHAR(16)  NOT NULL DEFAULT 'staged',
+//      status_reason    VARCHAR(256),
+//      matched_txn_id   VARCHAR(36),
+//      matched_split_id VARCHAR(36),
+//      dest_account_id  VARCHAR(36),
+//      match_score      INT,
+//      category         VARCHAR(128),
+//      agent_notes      TEXT,
+//      reviewed_at      DATETIME,
+//      posted_at        DATETIME,
+//      reconciled_at    DATETIME,
+//      created_at       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//      updated_at       DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//      UNIQUE(source_system, external_id, account_id),
+//      FOREIGN KEY (session_id) REFERENCES import_sessions(id)
+//  );
+//
+//  CREATE INDEX idx_staged_status ON staged_records(status);
+//  CREATE INDEX idx_staged_account_date ON staged_records(account_id, date_posted);
+//  CREATE INDEX idx_staged_session ON staged_records(session_id);
+//  CREATE INDEX idx_staged_matched_txn ON staged_records(matched_txn_id);
+//
+//  CREATE TABLE match_candidates (
+//      id              VARCHAR(36) PRIMARY KEY,
+//      staged_id       VARCHAR(36) NOT NULL,
+//      txn_id          VARCHAR(36) NOT NULL,
+//      split_id        VARCHAR(36) NOT NULL,
+//      score           INT         NOT NULL,
+//      score_breakdown JSON        NOT NULL,
+//      is_selected     BOOLEAN     DEFAULT FALSE,
+//      created_at      DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//      UNIQUE(staged_id, split_id),
+//      FOREIGN KEY (staged_id) REFERENCES staged_records(id)
+//  );
+//
+//  CREATE INDEX idx_match_staged ON match_candidates(staged_id);
+//  CREATE INDEX idx_match_score ON match_candidates(staged_id, score DESC);
+//
+// ---------------------------------------------------------------------------
+// Agent Workflow — how an AI agent drives the pipeline
+// ---------------------------------------------------------------------------
+//
+// ## Typical Import Session
+//
+//  1. Agent receives a bank file (CSV download, OFX export, etc.)
+//  2. Agent calls Pipeline.ImportFile() → creates session, runs adapter, stages records
+//  3. Agent calls Pipeline.FindMatchesBatch() → scores all staged records against ledger
+//  4. For each staged record:
+//     a. If auto-matched (score >= 70): record already in "matched" status
+//     b. If candidates exist (score 20-69): agent reviews candidates, calls SelectMatch()
+//     c. If no match: agent categorizes (Categorize) with destination account
+//     d. If clearly not a real transaction: agent rejects (Reject)
+//  5. Agent calls Pipeline.PostBatch() → creates ledger transactions for all matched/categorized
+//  6. Agent calls Pipeline.Reconcile() for posted records verified against statement
+//
+// ## Agent Queries
+//
+// The staged_records table supports these common agent queries via SQL:
+//
+//  -- "What needs my attention?"
+//  SELECT * FROM staged_records WHERE status = 'staged' ORDER BY date_posted;
+//
+//  -- "Show me high-confidence matches I should approve"
+//  SELECT sr.*, mc.score, mc.score_breakdown
+//  FROM staged_records sr
+//  JOIN match_candidates mc ON mc.staged_id = sr.id AND mc.is_selected = TRUE
+//  WHERE sr.status = 'matched' AND mc.score >= 70
+//  ORDER BY mc.score DESC;
+//
+//  -- "What's unmatched for Chase this month?"
+//  SELECT * FROM staged_records
+//  WHERE source_system = 'chase' AND status = 'staged'
+//    AND date_posted >= '2026-03-01'
+//  ORDER BY date_posted;
+//
+//  -- "Import session summary"
+//  SELECT s.id, s.source_system, s.filename, s.record_count,
+//         COUNT(CASE WHEN sr.status = 'posted' THEN 1 END) as posted,
+//         COUNT(CASE WHEN sr.status = 'staged' THEN 1 END) as pending
+//  FROM import_sessions s
+//  LEFT JOIN staged_records sr ON sr.session_id = s.id
+//  GROUP BY s.id;
+//
+// ---------------------------------------------------------------------------
+// Source Adapter Registry — built-in adapters
+// ---------------------------------------------------------------------------
+//
+// Initial adapters to implement:
+//
+//  1. GenericOFXAdapter  — parses OFX/QFX files (Open Financial Exchange)
+//     Maps OFX <STMTTRN> elements to StagedRecord.
+//     ExternalID from <FITID>, amount from <TRNAMT>, date from <DTPOSTED>.
+//
+//  2. GenericCSVAdapter  — configurable CSV parser with column mapping
+//     Requires a CSVMapping config: which columns map to date, amount, description, etc.
+//     Supports header auto-detection and common bank CSV layouts.
+//
+//  3. ChaseBankCSVAdapter — Chase-specific CSV format
+//     Handles Chase's particular column layout and description formatting.
+//     ExternalID synthesized from date + amount + description hash when no ID column.
+//
+//  4. CashAppAdapter — Cash App JSON/CSV export
+//     Handles Cash App's transaction export format.
+//
+//  5. GenericQIFAdapter — Quicken Interchange Format
+//     Maps QIF records (D=date, T=amount, P=payee, N=check#, M=memo).
+//
+// Each adapter must:
+//   - Preserve raw data exactly as received in RawData
+//   - Generate stable ExternalIDs that survive re-import
+//   - Normalize amounts to the account's commodity denomination
+//   - Handle the source's date format(s) correctly
+//   - Set TxType when determinable from source data
+//
+// ---------------------------------------------------------------------------
+// Relationships summary
+// ---------------------------------------------------------------------------
+//
+//  ImportSession 1──* StagedRecord       (one import creates many records)
+//  StagedRecord  *──1 Account            (target ledger account)
+//  StagedRecord  1──* MatchCandidate     (potential matches to ledger)
+//  StagedRecord  *──0..1 Transaction     (ledger txn, after posting)
+//  StagedRecord  *──0..1 Split           (matched ledger split)
+//  StagedRecord  *──0..1 Account         (destination account, after categorization)
+//  MatchCandidate *──1 Transaction       (candidate ledger transaction)
+//  MatchCandidate *──1 Split             (candidate ledger split)
+//
+// ---------------------------------------------------------------------------
+// Dolt-specific considerations
+// ---------------------------------------------------------------------------
+//
+// Since the staging tables live in Dolt:
+//   - Every import session is a Dolt commit (audit trail for free)
+//   - Agent categorization decisions can be reviewed via dolt diff
+//   - Branching enables "what-if" import scenarios before committing
+//   - Import sessions can be rolled back by reverting Dolt commits
+//   - Schema migrations use Dolt's ALTER TABLE (MySQL-compatible)
