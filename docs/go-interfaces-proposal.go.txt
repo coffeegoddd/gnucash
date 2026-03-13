@@ -1,0 +1,469 @@
+// Package accounting defines minimal Go interfaces and types for double-entry
+// accounting, derived from GnuCash's C/C++ engine (libgnucash/engine/).
+//
+// This file is a design proposal — not compilable production code. It captures
+// the core abstractions, their relationships, and the minimal surface area
+// needed to implement complete double-entry accounting in Go.
+//
+// ## Design Principles
+//
+//  1. Split-based transactions (GnuCash model) — every Transaction has ≥2 Splits
+//     whose Values sum to zero in the transaction's currency.
+//  2. Amount vs Value distinction for multi-currency: Amount is in the account's
+//     commodity; Value is in the transaction's balancing currency.
+//  3. Exact rational arithmetic (no floats) via Numeric.
+//  4. Account hierarchy (tree rooted at a single Root account).
+//  5. Lot tracking for capital gains, inventory, and invoices.
+//  6. Commodity/currency abstraction — everything traded is a Commodity.
+//  7. Interfaces for storage/backend, not concrete implementations.
+package accounting
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ---------------------------------------------------------------------------
+// Foundational types
+// ---------------------------------------------------------------------------
+
+// ID is a globally unique, immutable identifier for every entity.
+// Corresponds to GnuCash's GncGUID.
+type ID = uuid.UUID
+
+// Numeric is an exact rational number (numerator / denominator).
+// Denominators are always positive. This replaces gnc_numeric.
+//
+// GnuCash represents monetary values as int64 num / int64 denom.
+// The denominator typically encodes the smallest currency unit
+// (e.g. 100 for USD cents, 1000 for BHD fils).
+type Numeric struct {
+	Num   int64 // numerator
+	Denom int64 // denominator (always > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Commodity — the thing an account tracks (currency, stock, metal, …)
+// ---------------------------------------------------------------------------
+
+// CommodityNamespace categorises commodities (ISO4217 for currencies,
+// exchange names like NASDAQ for stocks, etc.).
+// Corresponds to gnc_commodity_namespace.
+type CommodityNamespace string
+
+const (
+	NamespaceCurrency CommodityNamespace = "CURRENCY" // ISO 4217
+	NamespaceTemplate CommodityNamespace = "template"
+)
+
+// Commodity represents anything tradeable: a currency, a stock, a mutual
+// fund unit, a commodity like gold, etc.
+// Corresponds to gnc_commodity.
+//
+// SQL table: commodities (guid, namespace, mnemonic, fullname, cusip, fraction, quote_flag, quote_source, quote_tz)
+type Commodity struct {
+	ID        ID
+	Namespace CommodityNamespace // e.g. "CURRENCY", "NASDAQ"
+	Mnemonic  string             // ticker or ISO code, e.g. "USD", "AAPL"
+	Fullname  string             // display name, e.g. "US Dollar"
+	CUSIP     string             // CUSIP/ISIN or other unique exchange code
+	Fraction  int                // smallest fractional unit, e.g. 100 for USD
+}
+
+// IsCurrency reports whether this commodity is an ISO 4217 currency.
+func (c *Commodity) IsCurrency() bool {
+	return c.Namespace == NamespaceCurrency
+}
+
+// ---------------------------------------------------------------------------
+// Account — a named ledger in an account hierarchy
+// ---------------------------------------------------------------------------
+
+// AccountType enumerates the fundamental account classifications.
+// Corresponds to GNCAccountType in Account.h.
+type AccountType int
+
+const (
+	AccountTypeBank       AccountType = iota // 0  — savings/checking
+	AccountTypeCash                          // 1
+	AccountTypeAsset                         // 2
+	AccountTypeCredit                        // 3  — credit card
+	AccountTypeLiability                     // 4
+	AccountTypeStock                         // 5
+	AccountTypeMutual                        // 6
+	AccountTypeCurrency                      // 7  — foreign currency holding
+	AccountTypeIncome                        // 8
+	AccountTypeExpense                       // 9
+	AccountTypeEquity                        // 10
+	AccountTypeReceivable                    // 11 — A/R
+	AccountTypePayable                       // 12 — A/P
+	AccountTypeRoot                          // 13 — hidden tree root
+	AccountTypeTrading                       // 14 — multi-commodity trading
+)
+
+// Account is a named node in the account tree. Each account tracks balances
+// denominated in exactly one Commodity.
+// Corresponds to Account/AccountPrivate in Account.h / AccountP.hpp.
+//
+// SQL table: accounts (guid, name, account_type, commodity_guid, commodity_scu,
+//
+//	non_std_scu, parent_guid, code, description, hidden, placeholder)
+type Account struct {
+	ID          ID
+	Name        string
+	Code        string // user-assigned reporting code (e.g. "1000")
+	Description string
+	Type        AccountType
+	Commodity   *Commodity // what this account denominates in
+	SCU         int        // smallest commodity unit (overrides Commodity.Fraction when non-standard)
+	ParentID    *ID        // nil for root
+	Hidden      bool
+	Placeholder bool
+	Notes       string
+	Color       string
+}
+
+// ---------------------------------------------------------------------------
+// Split — one leg of a transaction, touching exactly one account
+// ---------------------------------------------------------------------------
+
+// ReconcileState tracks whether a split has been reconciled with a bank
+// statement. Corresponds to NREC/CREC/YREC/FREC/VREC in Split.h.
+type ReconcileState byte
+
+const (
+	ReconcileNot       ReconcileState = 'n' // not reconciled
+	ReconcileCleared   ReconcileState = 'c' // cleared
+	ReconcileReconciled ReconcileState = 'y' // reconciled
+	ReconcileFrozen    ReconcileState = 'f' // frozen into accounting period
+	ReconcileVoid      ReconcileState = 'v' // voided
+)
+
+// Split is a single entry in a transaction, debiting or crediting one account.
+// Corresponds to split_s in SplitP.hpp.
+//
+// The critical distinction is Amount vs Value:
+//   - Amount: quantity in the *account's* commodity (e.g. 10 shares of AAPL)
+//   - Value:  worth in the *transaction's* currency (e.g. $1750 USD)
+//
+// For same-currency transactions, Amount == Value.
+//
+// SQL table: splits (guid, tx_guid, account_guid, memo, action,
+//
+//	reconcile_state, reconcile_date, value, quantity, lot_guid)
+type Split struct {
+	ID             ID
+	TransactionID  ID
+	AccountID      ID
+	LotID          *ID    // nil if not assigned to a lot
+	Memo           string // short user note
+	Action         string // e.g. "Buy", "Sell", "Deposit", "Check"
+	Amount         Numeric // quantity in account's commodity
+	Value          Numeric // value in transaction's currency
+	Reconcile      ReconcileState
+	ReconcileDate  *time.Time
+}
+
+// ---------------------------------------------------------------------------
+// Transaction — the double-entry journal entry
+// ---------------------------------------------------------------------------
+
+// TxnType classifies business-logic transaction types.
+// Corresponds to TXN_TYPE_* in Transaction.h.
+type TxnType byte
+
+const (
+	TxnTypeNone    TxnType = 0   // ordinary
+	TxnTypeInvoice TxnType = 'I'
+	TxnTypePayment TxnType = 'P'
+	TxnTypeLink    TxnType = 'L' // links invoice ↔ payment lots
+)
+
+// Transaction groups two or more Splits whose Values must sum to zero in the
+// transaction's Currency (the double-entry invariant).
+// Corresponds to transaction_s in TransactionP.hpp.
+//
+// SQL table: transactions (guid, currency_guid, num, post_date, enter_date, description)
+type Transaction struct {
+	ID          ID
+	Currency    *Commodity // valuation / balancing currency
+	Num         string     // check number, invoice number, etc.
+	Description string
+	DatePosted  time.Time  // when the transaction occurred at the bank
+	DateEntered time.Time  // when the user entered it
+	Type        TxnType
+	IsClosing   bool       // year-end closing transaction
+}
+
+// ---------------------------------------------------------------------------
+// Lot — groups splits for capital gains, inventory, invoices
+// ---------------------------------------------------------------------------
+
+// Lot tracks a collection of splits in one account that represent the same
+// "thing" bought and sold over time. Used for FIFO/LIFO capital gains
+// computation, A/R invoice matching, and inventory tracking.
+// Corresponds to GNCLot (gnc-lot.h).
+//
+// All splits in a lot must belong to the same account.
+// A lot is "closed" when its balance reaches zero.
+//
+// SQL table: lots (guid, account_guid, is_closed)
+type Lot struct {
+	ID        ID
+	AccountID ID
+	IsClosed  bool
+}
+
+// LotPolicy determines how splits are assigned to lots (e.g. FIFO, LIFO).
+// Corresponds to GNCPolicy in policy.h.
+type LotPolicy interface {
+	// PolicyName returns the policy identifier (e.g. "FIFO").
+	PolicyName() string
+	// AssignSplit decides which lot (or a new lot) a split should join.
+	AssignSplit(split *Split, lots []*Lot) *Lot
+}
+
+// ---------------------------------------------------------------------------
+// Price — a point-in-time price quote
+// ---------------------------------------------------------------------------
+
+// PriceSource indicates where a price quote came from.
+// Corresponds to PriceSource enum in gnc-pricedb.h.
+type PriceSource int
+
+const (
+	PriceSourceEditDialog PriceSource = iota
+	PriceSourceFQ                     // Finance::Quote
+	PriceSourceUser
+	PriceSourceTransferDialog
+	PriceSourceSplitRegister
+	PriceSourceSplitImport
+	PriceSourceStockSplit
+	PriceSourceStockTransaction
+	PriceSourceInvoice
+	PriceSourceTemp
+	PriceSourceInvalid
+)
+
+// Price represents the value of one commodity expressed in another at a
+// point in time. Corresponds to GNCPrice in gnc-pricedb.h.
+//
+// SQL table: prices (guid, commodity_guid, currency_guid, date, source, type, value)
+type Price struct {
+	ID        ID
+	Commodity *Commodity  // what is being priced
+	Currency  *Commodity  // denomination of the price
+	Time      time.Time
+	Source    PriceSource
+	Type      string      // "last", "bid", "ask", "nav", "transaction", "unknown"
+	Value     Numeric     // price of 1 unit of Commodity in Currency
+}
+
+// ---------------------------------------------------------------------------
+// Budget
+// ---------------------------------------------------------------------------
+
+// Budget represents a set of planned amounts per account per period.
+// Corresponds to GncBudget in gnc-budget.h.
+//
+// SQL tables: budgets (guid, name, description, num_periods)
+//
+//	budget_amounts (budget_guid, account_guid, period_num, amount)
+type Budget struct {
+	ID          ID
+	Name        string
+	Description string
+	NumPeriods  int
+}
+
+// BudgetAmount is one cell in the budget grid.
+type BudgetAmount struct {
+	BudgetID  ID
+	AccountID ID
+	Period    int     // 0-based period index
+	Amount    Numeric
+}
+
+// ---------------------------------------------------------------------------
+// Book — the top-level container
+// ---------------------------------------------------------------------------
+
+// Book is the top-level container holding the full set of accounts,
+// transactions, prices, and metadata. Every gnucash file is one Book.
+// Corresponds to QofBook.
+type Book struct {
+	ID            ID
+	RootAccountID ID // the single AccountTypeRoot account
+}
+
+// ---------------------------------------------------------------------------
+// Core engine interfaces
+// ---------------------------------------------------------------------------
+
+// TransactionEditor provides the begin/commit/rollback editing protocol
+// that GnuCash uses to ensure atomicity. No changes to a transaction or
+// its splits take effect until Commit is called.
+// Corresponds to xaccTransBeginEdit / xaccTransCommitEdit / xaccTransRollbackEdit.
+type TransactionEditor interface {
+	BeginEdit(txn *Transaction) error
+	CommitEdit(txn *Transaction) error
+	RollbackEdit(txn *Transaction) error
+}
+
+// AccountTree provides read access to the account hierarchy.
+type AccountTree interface {
+	// Root returns the root account.
+	Root() (*Account, error)
+	// Children returns the direct children of the given account.
+	Children(accountID ID) ([]*Account, error)
+	// Parent returns the parent, or nil for the root.
+	Parent(accountID ID) (*Account, error)
+	// ByID looks up a single account.
+	ByID(id ID) (*Account, error)
+	// ByFullName looks up an account by colon-separated path (e.g. "Assets:Bank:Checking").
+	ByFullName(name string) (*Account, error)
+}
+
+// SplitStore provides CRUD for splits within an account.
+type SplitStore interface {
+	// SplitsForAccount returns all splits in the given account, ordered by
+	// transaction post date.
+	SplitsForAccount(accountID ID) ([]*Split, error)
+	// SplitsForTransaction returns the splits belonging to a transaction.
+	SplitsForTransaction(txnID ID) ([]*Split, error)
+}
+
+// PriceDB provides read/write access to price quotes.
+// Corresponds to GNCPriceDB in gnc-pricedb.h.
+type PriceDB interface {
+	// AddPrice inserts or updates a price.
+	AddPrice(p *Price) error
+	// Lookup returns the best price for a commodity in a given currency
+	// on or before the given time.
+	Lookup(commodity, currency *Commodity, t time.Time) (*Price, error)
+	// PricesBetween returns all prices for a commodity pair in a time range.
+	PricesBetween(commodity, currency *Commodity, start, end time.Time) ([]*Price, error)
+}
+
+// LotStore provides lot-level operations.
+type LotStore interface {
+	LotsForAccount(accountID ID) ([]*Lot, error)
+	SplitsInLot(lotID ID) ([]*Split, error)
+	LotBalance(lotID ID) (Numeric, error)
+}
+
+// Engine ties together the core read/write operations needed for a
+// complete double-entry accounting system.
+type Engine interface {
+	AccountTree
+	SplitStore
+	PriceDB
+	LotStore
+	TransactionEditor
+
+	// Book returns the active book.
+	Book() (*Book, error)
+
+	// CreateAccount inserts a new account into the hierarchy.
+	CreateAccount(acct *Account) error
+	// UpdateAccount persists changes to an account.
+	UpdateAccount(acct *Account) error
+	// DeleteAccount removes an account (must have no splits).
+	DeleteAccount(id ID) error
+
+	// CreateTransaction creates a transaction with its splits atomically.
+	// The splits' Values must sum to zero.
+	CreateTransaction(txn *Transaction, splits []*Split) error
+
+	// AccountBalance returns the account's current balance.
+	AccountBalance(accountID ID) (Numeric, error)
+	// AccountClearedBalance returns the balance of cleared+reconciled splits.
+	AccountClearedBalance(accountID ID) (Numeric, error)
+	// AccountReconciledBalance returns the balance of reconciled splits only.
+	AccountReconciledBalance(accountID ID) (Numeric, error)
+
+	// TransactionImbalance computes the imbalance of a transaction.
+	// Returns zero for a balanced transaction.
+	TransactionImbalance(txnID ID) (Numeric, error)
+}
+
+// ---------------------------------------------------------------------------
+// Backend / storage interface
+// ---------------------------------------------------------------------------
+
+// Backend abstracts the persistent storage layer. Implementations could target
+// SQLite (like GnuCash's gnc-sql-backend), PostgreSQL, or Dolt.
+// Corresponds to QofBackend / gnc-sql-backend.
+type Backend interface {
+	// Load populates the in-memory engine from the backend.
+	Load() (Engine, error)
+	// Sync persists the current in-memory state.
+	Sync() error
+	// Close releases backend resources.
+	Close() error
+}
+
+// ---------------------------------------------------------------------------
+// Numeric operations (minimal set)
+// ---------------------------------------------------------------------------
+
+// These would be methods on Numeric in a real implementation.
+// They correspond to gnc_numeric_add, gnc_numeric_sub, etc.
+
+// NumericZero is the additive identity.
+var NumericZero = Numeric{Num: 0, Denom: 1}
+
+// Add returns a + b, with the result denominated in the given denom.
+// Corresponds to gnc_numeric_add.
+func (a Numeric) Add(b Numeric, denom int64) Numeric { panic("impl") }
+
+// Sub returns a - b.
+func (a Numeric) Sub(b Numeric, denom int64) Numeric { panic("impl") }
+
+// Mul returns a * b.
+func (a Numeric) Mul(b Numeric, denom int64) Numeric { panic("impl") }
+
+// Div returns a / b.
+func (a Numeric) Div(b Numeric, denom int64) Numeric { panic("impl") }
+
+// IsZero reports whether the numeric value is zero.
+func (a Numeric) IsZero() bool { return a.Num == 0 }
+
+// Neg returns -a.
+func (a Numeric) Neg() Numeric { return Numeric{Num: -a.Num, Denom: a.Denom} }
+
+// ---------------------------------------------------------------------------
+// Relationships summary (for reference)
+// ---------------------------------------------------------------------------
+//
+//  Book 1──1 RootAccount
+//  Account *──1 Commodity              (what the account denominates in)
+//  Account *──0..1 Account             (parent; nil = root)
+//  Account 1──* Split                  (all splits debiting/crediting this account)
+//  Account 1──* Lot                    (all lots in this account)
+//  Transaction 1──* Split              (≥2 splits; values sum to 0 in txn currency)
+//  Transaction *──1 Commodity          (the transaction's balancing currency)
+//  Split *──0..1 Lot                   (lot assignment for cap-gains tracking)
+//  Lot 1──* Split                      (all splits assigned to this lot)
+//  Price *──1 Commodity (commodity)    (what is priced)
+//  Price *──1 Commodity (currency)     (price denomination)
+//  Budget 1──* BudgetAmount
+//  BudgetAmount *──1 Account
+//
+// ---------------------------------------------------------------------------
+// SQL schema mapping (from gnc-*-sql.cpp backend files)
+// ---------------------------------------------------------------------------
+//
+//  Go Type       → SQL Table         Key Columns
+//  ─────────────────────────────────────────────────────────────────────
+//  Commodity     → commodities        guid, namespace, mnemonic, fullname, cusip, fraction
+//  Account       → accounts           guid, name, account_type, commodity_guid, parent_guid, code, description
+//  Transaction   → transactions       guid, currency_guid, num, post_date, enter_date, description
+//  Split         → splits             guid, tx_guid, account_guid, memo, action, reconcile_state, reconcile_date, value, quantity, lot_guid
+//  Lot           → lots               guid, account_guid, is_closed
+//  Price         → prices             guid, commodity_guid, currency_guid, date, source, type, value
+//  Budget        → budgets            guid, name, description, num_periods
+//  BudgetAmount  → budget_amounts     budget_guid, account_guid, period_num, amount
+//  (KVP)         → slots              obj_guid, name, slot_type, ... (arbitrary metadata)
+//  (Versions)    → versions           table_name, table_version
