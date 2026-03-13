@@ -201,3 +201,4 @@ messages.mo
 .logs/
 __pycache__/
 state.json
+.beads/
