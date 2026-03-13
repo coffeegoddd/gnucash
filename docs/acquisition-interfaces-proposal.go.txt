@@ -1,0 +1,809 @@
+// Package acquisition defines Go interfaces for financial data acquisition —
+// the mechanism of connecting to a user's bank or financial service and
+// downloading their transaction data.
+//
+// This file is a design proposal — not compilable production code. It captures
+// the abstraction layer needed to support multiple data sources (Plaid, OFX
+// Direct Connect, app-specific APIs, Open Banking) behind a unified interface.
+//
+// ## Design Principles
+//
+//  1. Provider-agnostic — a single interface abstracts Plaid, OFX DC, Venmo,
+//     Open Banking, etc. Callers never need to know which protocol is in use.
+//  2. Connection lifecycle — linking, refreshing, and unlinking are first-class
+//     operations. OAuth flows, OFX credentials, and API keys are all "connections."
+//  3. Incremental fetching — every fetch supports a cursor or date-based
+//     pagination so only new-since-last-fetch transactions are retrieved.
+//  4. Credential isolation — the acquisition layer never exposes raw credentials.
+//     A CredentialStore interface handles encryption, rotation, and storage.
+//  5. Raw fidelity — provider-specific data is preserved alongside normalized
+//     output so no information is lost during normalization.
+//  6. Staging integration — fetched transactions produce the same StagedRecord
+//     type from the staging package, enabling a seamless handoff to the
+//     match → categorize → post pipeline.
+//
+// ## Relationship to Other Packages
+//
+// - accounting (go-interfaces-proposal.go.txt): Account, Commodity, Numeric types
+// - staging (staging-pipeline-proposal.go.txt): StagedRecord, ImportSession types
+//
+// The acquisition layer sits UPSTREAM of staging:
+//
+//   Bank/API → [acquisition.Provider] → RawTransactions
+//                                            ↓
+//                                    [staging.Pipeline.ImportFromProvider()]
+//                                            ↓
+//                                      StagedRecords → match → post → ledger
+//
+// ## Derived From
+//
+// GnuCash's AQBanking integration (gnucash/import-export/aqb/):
+//   - AB_BANKING lifecycle: init → configure → send commands → cleanup
+//   - AB_ACCOUNT_SPEC: bank code, account number, unique ID, supported commands
+//   - AB_TRANSACTION with CommandGetTransactions, CommandGetBalance
+//   - GWEN_GUI callbacks for credential input (PIN/TAN, ChipTAN, PhotoTAN)
+//   - Credential caching in session-scoped hash tables
+//
+// GnuCash's OFX integration (gnucash/import-export/ofx/):
+//   - File-only import (no direct connect) — our OFX DC implementation fills this gap
+//   - OfxTransactionData: FITID, amount, dates, type, payee, memo
+//   - OfxAccountData: account_id, account_type, currency
+//
+// Modern API patterns (not in GnuCash):
+//   - Plaid Link (OAuth-based account linking), /transactions/sync (cursor-based)
+//   - Open Banking / PSD2 consent flows, structured creditor/debtor info
+//   - App-specific REST APIs (Cash App, Venmo) with API key auth
+package acquisition
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Re-use foundational types from the accounting package.
+type ID = uuid.UUID
+type Numeric = struct {
+	Num   int64
+	Denom int64
+}
+
+// ---------------------------------------------------------------------------
+// Institution — a bank or financial service
+// ---------------------------------------------------------------------------
+
+// Institution represents a bank, credit union, brokerage, or app that holds
+// financial accounts. Each Provider knows about the institutions it supports.
+//
+// For Plaid: maps to an "institution" object (ins_xxxx).
+// For OFX DC: maps to an FI entry in the OFX Home database (FI URL + org + FID).
+// For Open Banking: maps to an ASPSP (Account Servicing Payment Service Provider).
+// For app APIs: maps to the app itself (e.g. Cash App, Venmo).
+type Institution struct {
+	ID               string   // provider-scoped unique ID (e.g. "ins_3" for Plaid Chase)
+	Name             string   // display name (e.g. "Chase Bank")
+	URL              string   // institution's website
+	Logo             string   // URL to institution logo (if available)
+	PrimaryColor     string   // brand color (hex) for UI
+	Country          string   // ISO 3166-1 alpha-2
+	SupportedMethods []string // e.g. ["plaid", "ofx_dc", "open_banking"]
+	Capabilities     InstitutionCapabilities
+	ProviderMetadata map[string]any // provider-specific fields preserved as-is
+}
+
+// InstitutionCapabilities describes what operations an institution supports.
+// Not all institutions support all operations — e.g. some only provide
+// transactions, not balances or identity.
+type InstitutionCapabilities struct {
+	Transactions bool // can fetch transaction history
+	Balances     bool // can fetch current balances
+	Identity     bool // can fetch account holder identity
+	Investments  bool // can fetch investment positions/holdings
+}
+
+// ---------------------------------------------------------------------------
+// Connection — an authenticated link to a user's accounts
+// ---------------------------------------------------------------------------
+
+// ConnectionStatus tracks the health of a connection.
+type ConnectionStatus string
+
+const (
+	ConnectionActive       ConnectionStatus = "active"        // working, credentials valid
+	ConnectionDegraded     ConnectionStatus = "degraded"      // partially working (some accounts failing)
+	ConnectionReauth       ConnectionStatus = "reauth"        // needs user re-authentication
+	ConnectionExpired      ConnectionStatus = "expired"       // consent/token expired
+	ConnectionRevoked      ConnectionStatus = "revoked"       // user revoked access at institution
+	ConnectionDisconnected ConnectionStatus = "disconnected"  // explicitly unlinked by user
+	ConnectionError        ConnectionStatus = "error"         // unexpected failure
+)
+
+// Connection represents an authenticated link between the user and their
+// accounts at a specific institution, through a specific provider.
+//
+// For Plaid: maps to an "item" (access_token + item_id).
+// For OFX DC: maps to stored OFX credentials (user_id + password + FI URL).
+// For Open Banking: maps to a consent + access_token.
+// For app APIs: maps to an API key or OAuth token.
+//
+// A Connection can surface multiple RemoteAccounts (e.g. a Plaid item for
+// Chase might expose checking, savings, and credit card).
+//
+// SQL table: connections
+//
+//	CREATE TABLE connections (
+//	    id                VARCHAR(36) PRIMARY KEY,
+//	    provider          VARCHAR(32)  NOT NULL,  -- "plaid", "ofx_dc", "open_banking", "cashapp"
+//	    institution_id    VARCHAR(128) NOT NULL,  -- provider's institution identifier
+//	    institution_name  VARCHAR(256) NOT NULL,  -- display name for UI
+//	    status            VARCHAR(16)  NOT NULL DEFAULT 'active',
+//	    status_detail     TEXT,                   -- human-readable status explanation
+//	    credential_ref    VARCHAR(256) NOT NULL,  -- reference into CredentialStore (NEVER raw creds)
+//	    last_successful_fetch DATETIME,           -- when data was last fetched successfully
+//	    fetch_cursor      TEXT,                   -- provider's cursor for incremental fetch
+//	    consent_expires   DATETIME,               -- when consent/access expires (Open Banking, Plaid)
+//	    error_code        VARCHAR(64),            -- provider error code if status=error/reauth
+//	    error_message     TEXT,                   -- provider error message
+//	    metadata          JSON,                   -- provider-specific connection metadata
+//	    created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//	    updated_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+//	);
+//
+//	CREATE INDEX idx_conn_provider ON connections(provider);
+//	CREATE INDEX idx_conn_status ON connections(status);
+//	CREATE INDEX idx_conn_institution ON connections(institution_id);
+type Connection struct {
+	ID              ID
+	Provider        string           // which provider manages this connection
+	InstitutionID   string           // provider's institution identifier
+	InstitutionName string           // display name
+	Status          ConnectionStatus
+	StatusDetail    string           // human-readable explanation
+	CredentialRef   string           // opaque reference into CredentialStore
+
+	LastSuccessfulFetch *time.Time   // when data was last fetched successfully
+	FetchCursor         string       // provider's cursor for incremental fetch
+	ConsentExpires      *time.Time   // when consent/access expires
+
+	ErrorCode    string
+	ErrorMessage string
+	Metadata     map[string]any // provider-specific connection data
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// ---------------------------------------------------------------------------
+// RemoteAccount — an account discovered at a linked institution
+// ---------------------------------------------------------------------------
+
+// RemoteAccountType classifies the account at the institution.
+// Corresponds to OFX account types and Plaid account types.
+type RemoteAccountType string
+
+const (
+	RemoteAccountChecking   RemoteAccountType = "checking"
+	RemoteAccountSavings    RemoteAccountType = "savings"
+	RemoteAccountCreditCard RemoteAccountType = "credit_card"
+	RemoteAccountLoan       RemoteAccountType = "loan"
+	RemoteAccountMortgage   RemoteAccountType = "mortgage"
+	RemoteAccountBrokerage  RemoteAccountType = "brokerage"
+	RemoteAccountRetirement RemoteAccountType = "retirement"    // 401k, IRA
+	RemoteAccountMoneyMkt   RemoteAccountType = "money_market"
+	RemoteAccountLineCredit RemoteAccountType = "line_of_credit"
+	RemoteAccountOther      RemoteAccountType = "other"
+)
+
+// RemoteAccountSubtype provides finer classification when available.
+// Examples: "401k", "roth_ira", "cd", "hsa", "auto_loan"
+type RemoteAccountSubtype string
+
+// RemoteAccount represents an account discovered at a linked institution.
+// This is the institution's view of the account — the user maps it to a
+// ledger Account for import.
+//
+// For Plaid: maps to an "account" object within an item.
+// For OFX DC: maps to an account in the OFX response (bankacctfrom/ccacctfrom).
+// For Open Banking: maps to an account resource in the AISP API.
+//
+// SQL table: remote_accounts
+//
+//	CREATE TABLE remote_accounts (
+//	    id                VARCHAR(36) PRIMARY KEY,
+//	    connection_id     VARCHAR(36)  NOT NULL REFERENCES connections(id),
+//	    provider_id       VARCHAR(256) NOT NULL,  -- provider's account ID
+//	    name              VARCHAR(256),           -- account name from institution
+//	    official_name     VARCHAR(256),           -- official institution name
+//	    mask              VARCHAR(16),            -- last 4 digits (e.g. "1234")
+//	    account_type      VARCHAR(32)  NOT NULL,
+//	    account_subtype   VARCHAR(64),
+//	    currency          VARCHAR(3),             -- ISO 4217
+//	    ledger_account_id VARCHAR(36),            -- linked ledger account (user maps this)
+//	    is_active         BOOLEAN      DEFAULT TRUE,  -- user can deactivate unwanted accounts
+//	    metadata          JSON,                   -- provider-specific account data
+//	    created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//	    updated_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//	    UNIQUE(connection_id, provider_id)
+//	);
+//
+//	CREATE INDEX idx_remote_acct_conn ON remote_accounts(connection_id);
+//	CREATE INDEX idx_remote_acct_ledger ON remote_accounts(ledger_account_id);
+type RemoteAccount struct {
+	ID             ID
+	ConnectionID   ID
+	ProviderID     string             // provider's own account ID
+	Name           string             // account name from institution
+	OfficialName   string             // official name (may differ from Name)
+	Mask           string             // last 4 digits of account number
+	Type           RemoteAccountType
+	Subtype        RemoteAccountSubtype
+	Currency       string             // ISO 4217
+
+	LedgerAccountID *ID               // mapped ledger account (nil if unmapped)
+	IsActive        bool              // user can deactivate accounts they don't want to sync
+
+	Metadata  map[string]any
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// ---------------------------------------------------------------------------
+// Raw Transaction — normalized output from a provider fetch
+// ---------------------------------------------------------------------------
+
+// RawTransaction is a single transaction fetched from a provider, normalized
+// into a common structure. Each provider implementation maps its native
+// transaction format into this type.
+//
+// This type is intentionally close to staging.StagedRecord but kept separate
+// because: (a) it doesn't have staging lifecycle fields, and (b) it preserves
+// provider-specific context that the staging layer doesn't need to know about.
+//
+// The acquisition→staging bridge creates StagedRecords from RawTransactions.
+type RawTransaction struct {
+	ProviderTxnID string    // provider's unique transaction ID (Plaid transaction_id, OFX FITID)
+	RemoteAccountID string  // provider's account ID this txn belongs to
+	Date          time.Time // posted date
+	DateAuthorized *time.Time // authorized/initiated date (if available, e.g. Plaid)
+	Amount        Numeric   // signed amount (negative = debit in most providers)
+	Currency      string    // ISO 4217
+
+	// Description fields — providers expose varying levels of detail
+	Name          string // primary description (Plaid: name, OFX: memo, HBCI: purpose)
+	MerchantName  string // clean merchant name (Plaid enrichment, not always available)
+	Memo          string // additional notes
+	CheckNumber   string // check number if applicable
+
+	// Classification
+	Category      []string // provider categories (e.g. Plaid: ["Food and Drink", "Restaurants"])
+	TxType        string   // "debit", "credit", "transfer", etc.
+	Pending       bool     // true if transaction hasn't settled
+
+	// Provider-specific raw data (full fidelity)
+	RawData map[string]any
+}
+
+// ---------------------------------------------------------------------------
+// Balance — account balance snapshot
+// ---------------------------------------------------------------------------
+
+// BalanceType classifies the kind of balance reported.
+type BalanceType string
+
+const (
+	BalanceAvailable BalanceType = "available"  // funds available for use
+	BalanceCurrent   BalanceType = "current"    // current balance (booked)
+	BalancePending   BalanceType = "pending"    // includes pending transactions
+	BalanceLimit     BalanceType = "limit"      // credit limit (credit cards, LOCs)
+)
+
+// Balance is a point-in-time balance for a remote account.
+type Balance struct {
+	RemoteAccountID string
+	Type            BalanceType
+	Amount          Numeric
+	Currency        string    // ISO 4217
+	AsOf            time.Time // when this balance was current
+}
+
+// ---------------------------------------------------------------------------
+// Fetch Result — what a provider returns from a fetch operation
+// ---------------------------------------------------------------------------
+
+// FetchResult contains the output of a transaction/balance fetch.
+// The cursor is opaque to callers — pass it back on the next fetch for
+// incremental retrieval.
+type FetchResult struct {
+	Transactions []*RawTransaction
+	HasMore      bool   // true if more transactions available (paginated)
+	NextCursor   string // pass to next FetchTransactions call for incremental fetch
+}
+
+// BalanceFetchResult contains balances for one or more accounts.
+type BalanceFetchResult struct {
+	Balances []*Balance
+	AsOf     time.Time // when these balances were fetched
+}
+
+// ---------------------------------------------------------------------------
+// Link Flow — OAuth / credential-based account linking
+// ---------------------------------------------------------------------------
+
+// LinkMethod describes how a user authenticates with an institution.
+type LinkMethod string
+
+const (
+	LinkMethodOAuth      LinkMethod = "oauth"       // redirect-based OAuth (Plaid Link, Open Banking)
+	LinkMethodCredential LinkMethod = "credential"  // direct username/password (OFX DC)
+	LinkMethodAPIKey     LinkMethod = "api_key"     // app-issued API key (some app APIs)
+)
+
+// LinkRequest initiates account linking with an institution.
+type LinkRequest struct {
+	InstitutionID string            // which institution to link
+	Method        LinkMethod        // how to authenticate
+	RedirectURI   string            // OAuth callback URL (for OAuth flows)
+	Credentials   map[string]string // for credential-based flows (NEVER logged or stored raw)
+	Scopes        []string          // requested permission scopes (Open Banking)
+	Language      string            // user's locale for consent UI
+	Metadata      map[string]any    // provider-specific link options
+}
+
+// LinkResponse is the result of initiating a link flow.
+// For OAuth flows, this contains a URL to redirect the user to.
+// For credential flows, this may return immediately with the connection.
+type LinkResponse struct {
+	// OAuth flows
+	LinkURL   string // redirect user here to complete OAuth (empty for credential flows)
+	LinkToken string // provider's link session token (Plaid link_token, etc.)
+
+	// Credential flows (or after OAuth completes)
+	Connection *Connection     // populated if linking completed synchronously
+	Accounts   []*RemoteAccount // discovered accounts (populated if link is complete)
+
+	// Multi-factor authentication
+	MFARequired bool             // true if MFA challenge issued
+	MFAType     string           // "sms", "email", "totp", "security_question", "device"
+	MFAPrompt   string           // prompt to display to user
+
+	// Status
+	Status  string // "pending_redirect", "pending_mfa", "complete", "error"
+	ErrorCode   string
+	ErrorMessage string
+}
+
+// MFAResponse submits the user's MFA answer.
+type MFAResponse struct {
+	ConnectionID ID                // which connection is being linked
+	MFACode      string            // user's response to MFA challenge
+	Metadata     map[string]string // additional MFA fields if needed
+}
+
+// OAuthCallback processes the return from an OAuth redirect.
+type OAuthCallback struct {
+	Code        string // authorization code from OAuth redirect
+	State       string // state parameter for CSRF verification
+	RedirectURI string // must match original LinkRequest.RedirectURI
+}
+
+// ---------------------------------------------------------------------------
+// Provider — the core acquisition interface
+// ---------------------------------------------------------------------------
+
+// Provider is the interface that each financial data source implements.
+// A Provider knows how to link accounts, fetch transactions, fetch balances,
+// and manage credentials for one specific protocol or API.
+//
+// This is the primary abstraction in the acquisition package. Each
+// implementation encapsulates a single connection method:
+//
+//   PlaidProvider       — Plaid API (OAuth Link, /transactions/sync, /accounts/balance/get)
+//   OFXDirectProvider   — OFX Direct Connect (HTTP POST to bank's OFX server)
+//   OpenBankingProvider — PSD2/UK Open Banking (consent + AISP APIs)
+//   CashAppProvider     — Cash App API
+//   VenmoProvider       — Venmo API
+//
+// ## How each implementation differs:
+//
+// ### PlaidProvider
+//   - Link: Plaid Link (client-side OAuth widget) → exchange public_token → access_token
+//   - Fetch: /transactions/sync with cursor (added/modified/removed diffs)
+//   - Balances: /accounts/balance/get (real-time)
+//   - Credentials: access_token stored encrypted; no expiry but can be invalidated
+//   - Unique: provides enriched merchant names, categories, location data
+//   - Webhook support for real-time transaction updates
+//
+// ### OFXDirectProvider
+//   - Link: user provides username + password + institution FI URL
+//   - Fetch: HTTP POST OFX request with <STMTTRNRQ> date range; no cursor,
+//     uses date-based incremental (last fetch date → now)
+//   - Balances: included in statement response (<LEDGERBAL>, <AVAILBAL>)
+//   - Credentials: username/password stored encrypted; may require MFA per-request
+//   - Unique: uses FITID for dedup; supports HBCI/FinTS via same pattern
+//   - No webhook support — polling only
+//
+// ### OpenBankingProvider (PSD2/UK)
+//   - Link: consent flow → redirect to bank → authorization code → access_token
+//   - Fetch: GET /accounts/{id}/transactions with pagination; consent-scoped
+//   - Balances: GET /accounts/{id}/balances
+//   - Credentials: access_token + refresh_token; consent expires (90 days typical)
+//   - Unique: structured creditor/debtor info, regulated data format
+//   - Strong Customer Authentication (SCA) requirements
+//
+// ### App-specific Providers (CashApp, Venmo)
+//   - Link: OAuth or API key issued by app
+//   - Fetch: app-specific REST API with pagination
+//   - Balances: app-specific endpoint
+//   - Credentials: OAuth token or API key
+//   - Unique: app-specific transaction types (P2P, boost, Bitcoin, etc.)
+type Provider interface {
+	// --- Identity ---
+
+	// Name returns this provider's unique identifier (e.g. "plaid", "ofx_dc").
+	Name() string
+
+	// SupportedCountries returns ISO 3166-1 alpha-2 country codes this provider
+	// serves (e.g. ["US", "CA", "GB"]).
+	SupportedCountries() []string
+
+	// --- Institution Discovery ---
+
+	// SearchInstitutions finds institutions this provider can connect to.
+	// Query is a user-supplied search string (bank name, routing number, etc.).
+	SearchInstitutions(ctx context.Context, query string) ([]*Institution, error)
+
+	// GetInstitution retrieves a specific institution by its provider-scoped ID.
+	GetInstitution(ctx context.Context, id string) (*Institution, error)
+
+	// --- Account Linking ---
+
+	// InitiateLink begins the account linking flow for an institution.
+	// For OAuth providers (Plaid, Open Banking), returns a LinkResponse with
+	// a redirect URL. For credential providers (OFX DC), may complete
+	// synchronously if no MFA is required.
+	InitiateLink(ctx context.Context, req *LinkRequest) (*LinkResponse, error)
+
+	// CompleteOAuth finishes an OAuth-based link flow after the user redirects
+	// back. Creates the Connection and discovers available accounts.
+	// Only applicable to OAuth-based providers; credential-based providers
+	// complete linking in InitiateLink.
+	CompleteOAuth(ctx context.Context, connectionID ID, callback *OAuthCallback) (*LinkResponse, error)
+
+	// SubmitMFA submits a multi-factor authentication response during linking
+	// or re-authentication. Returns updated link status.
+	SubmitMFA(ctx context.Context, resp *MFAResponse) (*LinkResponse, error)
+
+	// --- Connection Management ---
+
+	// RefreshConnection checks the health of a connection and refreshes
+	// credentials if needed (e.g. rotating OAuth tokens). Returns updated status.
+	RefreshConnection(ctx context.Context, connectionID ID) (*Connection, error)
+
+	// ReauthConnection initiates re-authentication for a connection that is in
+	// "reauth" status. Returns a LinkResponse similar to InitiateLink.
+	ReauthConnection(ctx context.Context, connectionID ID) (*LinkResponse, error)
+
+	// UnlinkConnection permanently disconnects from the institution and
+	// revokes access tokens. The Connection is marked "disconnected."
+	// Remote accounts are preserved for historical reference but deactivated.
+	UnlinkConnection(ctx context.Context, connectionID ID) error
+
+	// --- Account Discovery ---
+
+	// ListAccounts returns all remote accounts discovered for a connection.
+	// This is populated during linking and may be refreshed on subsequent calls.
+	ListAccounts(ctx context.Context, connectionID ID) ([]*RemoteAccount, error)
+
+	// --- Data Fetching ---
+
+	// FetchTransactions retrieves transactions for a remote account.
+	//
+	// Incremental fetching:
+	//   - First call: pass cursor="" to fetch all available history
+	//   - Subsequent calls: pass the cursor from FetchResult.NextCursor
+	//     to fetch only transactions added/modified since last fetch
+	//
+	// For providers that don't support cursors (OFX DC), the implementation
+	// uses date-based pagination internally but presents the same cursor API
+	// to callers. The cursor encodes the last-fetched date.
+	//
+	// The since parameter is an optional lower bound on transaction dates.
+	// Some providers ignore this if cursor-based sync is available.
+	FetchTransactions(ctx context.Context, remoteAccountID ID, cursor string, since *time.Time) (*FetchResult, error)
+
+	// FetchBalances retrieves current balances for all accounts in a connection.
+	// Returns available, current, and limit balances where applicable.
+	FetchBalances(ctx context.Context, connectionID ID) (*BalanceFetchResult, error)
+}
+
+// ---------------------------------------------------------------------------
+// CredentialStore — secure credential storage
+// ---------------------------------------------------------------------------
+
+// CredentialStore is the interface for securely storing and retrieving
+// provider credentials. The acquisition layer NEVER handles raw credentials
+// directly — it stores an opaque reference (credential_ref) and retrieves
+// credentials only when needed for API calls.
+//
+// Implementations might use:
+//   - OS keychain (macOS Keychain, Linux Secret Service)
+//   - Encrypted file (age/sops)
+//   - Vault (HashiCorp Vault, AWS Secrets Manager)
+//   - Encrypted Dolt column (application-level encryption)
+//
+// ## What gets stored per provider:
+//
+//   Plaid:         access_token (string)
+//   OFX DC:        username, password, FI URL, org, FID
+//   Open Banking:  access_token, refresh_token, consent_id
+//   App APIs:      api_key or oauth_token + refresh_token
+//
+// The CredentialStore encrypts at rest and provides type-safe accessors
+// through a generic key-value interface.
+type CredentialStore interface {
+	// Store encrypts and persists credentials under the given reference.
+	// If a credential with this ref already exists, it is overwritten.
+	Store(ctx context.Context, ref string, credentials map[string]string) error
+
+	// Retrieve decrypts and returns credentials for the given reference.
+	// Returns an error if the ref doesn't exist or decryption fails.
+	Retrieve(ctx context.Context, ref string) (map[string]string, error)
+
+	// Delete permanently removes credentials for the given reference.
+	Delete(ctx context.Context, ref string) error
+
+	// Exists checks whether credentials exist for the given reference
+	// without decrypting them.
+	Exists(ctx context.Context, ref string) (bool, error)
+}
+
+// ---------------------------------------------------------------------------
+// ConnectionStore — persistence for connections and remote accounts
+// ---------------------------------------------------------------------------
+
+// ConnectionFilter defines query criteria for listing connections.
+type ConnectionFilter struct {
+	Provider      *string
+	InstitutionID *string
+	Status        *ConnectionStatus
+	Limit         int
+	Offset        int
+}
+
+// ConnectionStore provides CRUD for connections and remote accounts.
+// Separated from Provider because storage is provider-agnostic.
+type ConnectionStore interface {
+	// --- Connections ---
+	CreateConnection(ctx context.Context, conn *Connection) error
+	GetConnection(ctx context.Context, id ID) (*Connection, error)
+	UpdateConnection(ctx context.Context, conn *Connection) error
+	ListConnections(ctx context.Context, filter ConnectionFilter) ([]*Connection, error)
+	DeleteConnection(ctx context.Context, id ID) error
+
+	// --- Remote Accounts ---
+	CreateRemoteAccount(ctx context.Context, acct *RemoteAccount) error
+	GetRemoteAccount(ctx context.Context, id ID) (*RemoteAccount, error)
+	UpdateRemoteAccount(ctx context.Context, acct *RemoteAccount) error
+	ListRemoteAccounts(ctx context.Context, connectionID ID) ([]*RemoteAccount, error)
+
+	// MapToLedger links a remote account to a ledger account.
+	// This mapping is what connects "Chase Checking ****1234" to
+	// "Assets:Bank:Chase Checking" in the ledger.
+	MapToLedger(ctx context.Context, remoteAccountID ID, ledgerAccountID ID) error
+}
+
+// ---------------------------------------------------------------------------
+// Sync Orchestrator — coordinates periodic fetching
+// ---------------------------------------------------------------------------
+
+// SyncResult summarizes what happened during a sync operation.
+type SyncResult struct {
+	ConnectionID    ID
+	RemoteAccountID ID
+	TransactionCount int       // number of new/modified transactions fetched
+	NewCursor       string     // updated cursor for next sync
+	Balances        []*Balance // current balances (if fetched)
+	Errors          []SyncError
+	FetchedAt       time.Time
+}
+
+// SyncError records a non-fatal error during sync (e.g. one account failed
+// while others succeeded).
+type SyncError struct {
+	RemoteAccountID ID
+	Code            string
+	Message         string
+}
+
+// SyncOrchestrator coordinates periodic fetching across all active connections.
+// It calls Provider.FetchTransactions for each active remote account, bridges
+// results into the staging pipeline, and updates connection/cursor state.
+//
+// This is the primary entry point for automated/scheduled data fetching.
+type SyncOrchestrator interface {
+	// SyncConnection fetches new transactions and balances for all active
+	// accounts in a connection. Updates the connection's fetch cursor.
+	// Returns per-account results.
+	SyncConnection(ctx context.Context, connectionID ID) ([]*SyncResult, error)
+
+	// SyncAccount fetches new transactions for a single remote account.
+	SyncAccount(ctx context.Context, remoteAccountID ID) (*SyncResult, error)
+
+	// SyncAll fetches new data for all active connections.
+	// Intended for scheduled/cron execution.
+	SyncAll(ctx context.Context) ([]*SyncResult, error)
+}
+
+// ---------------------------------------------------------------------------
+// Webhook Handler — real-time update support
+// ---------------------------------------------------------------------------
+
+// WebhookEvent represents a real-time notification from a provider.
+// Only some providers support webhooks (Plaid, Open Banking).
+type WebhookEvent struct {
+	Provider     string         // which provider sent this
+	EventType    string         // provider-specific event type
+	ConnectionID ID             // which connection this affects
+	Payload      map[string]any // raw webhook payload
+	ReceivedAt   time.Time
+}
+
+// WebhookHandler processes real-time notifications from providers.
+// Implementations validate the webhook signature, parse the event,
+// and trigger appropriate actions (e.g. sync on new transactions).
+type WebhookHandler interface {
+	// HandleWebhook validates and processes a webhook event.
+	// Returns the event for logging, or error if validation fails.
+	HandleWebhook(ctx context.Context, provider string, payload []byte, headers map[string]string) (*WebhookEvent, error)
+}
+
+// ---------------------------------------------------------------------------
+// Provider Registry — manages available providers
+// ---------------------------------------------------------------------------
+
+// ProviderRegistry manages the set of available providers and routes
+// operations to the correct provider for a given connection.
+type ProviderRegistry interface {
+	// Register adds a provider to the registry.
+	Register(provider Provider)
+
+	// Get returns a provider by name, or error if not registered.
+	Get(name string) (Provider, error)
+
+	// List returns all registered providers.
+	List() []Provider
+
+	// ForConnection returns the provider that manages a given connection.
+	ForConnection(ctx context.Context, connectionID ID) (Provider, error)
+}
+
+// ---------------------------------------------------------------------------
+// Relationships summary
+// ---------------------------------------------------------------------------
+//
+// Provider 1──* Institution       (a provider serves many institutions)
+// Connection *──1 Institution     (each connection is to one institution)
+// Connection *──1 Provider        (each connection uses one provider)
+// Connection 1──* RemoteAccount   (a link discovers multiple accounts)
+// RemoteAccount *──0..1 Account   (mapped to ledger account by user)
+// Connection 1──1 CredentialRef   (opaque pointer into CredentialStore)
+//
+// Acquisition → Staging bridge:
+//   RawTransaction → StagedRecord  (1:1, acquisition output feeds staging input)
+//   SyncOrchestrator calls Pipeline.ImportFromProvider() to create StagedRecords
+//
+// ---------------------------------------------------------------------------
+// SQL Schema — complete DDL for the acquisition layer
+// ---------------------------------------------------------------------------
+//
+// All tables are designed for Dolt (MySQL-compatible DDL).
+//
+//  CREATE TABLE connections (
+//      id                   VARCHAR(36) PRIMARY KEY,
+//      provider             VARCHAR(32)  NOT NULL,
+//      institution_id       VARCHAR(128) NOT NULL,
+//      institution_name     VARCHAR(256) NOT NULL,
+//      status               VARCHAR(16)  NOT NULL DEFAULT 'active',
+//      status_detail        TEXT,
+//      credential_ref       VARCHAR(256) NOT NULL,
+//      last_successful_fetch DATETIME,
+//      fetch_cursor         TEXT,
+//      consent_expires      DATETIME,
+//      error_code           VARCHAR(64),
+//      error_message        TEXT,
+//      metadata             JSON,
+//      created_at           DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//      updated_at           DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+//  );
+//
+//  CREATE INDEX idx_conn_provider ON connections(provider);
+//  CREATE INDEX idx_conn_status ON connections(status);
+//  CREATE INDEX idx_conn_institution ON connections(institution_id);
+//
+//  CREATE TABLE remote_accounts (
+//      id                VARCHAR(36) PRIMARY KEY,
+//      connection_id     VARCHAR(36)  NOT NULL REFERENCES connections(id),
+//      provider_id       VARCHAR(256) NOT NULL,
+//      name              VARCHAR(256),
+//      official_name     VARCHAR(256),
+//      mask              VARCHAR(16),
+//      account_type      VARCHAR(32)  NOT NULL,
+//      account_subtype   VARCHAR(64),
+//      currency          VARCHAR(3),
+//      ledger_account_id VARCHAR(36),
+//      is_active         BOOLEAN      DEFAULT TRUE,
+//      metadata          JSON,
+//      created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//      updated_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+//      UNIQUE(connection_id, provider_id)
+//  );
+//
+//  CREATE INDEX idx_remote_acct_conn ON remote_accounts(connection_id);
+//  CREATE INDEX idx_remote_acct_ledger ON remote_accounts(ledger_account_id);
+//
+//  -- Sync history for auditing and debugging
+//  CREATE TABLE sync_log (
+//      id                  VARCHAR(36) PRIMARY KEY,
+//      connection_id       VARCHAR(36)  NOT NULL REFERENCES connections(id),
+//      remote_account_id   VARCHAR(36)  REFERENCES remote_accounts(id),
+//      started_at          DATETIME     NOT NULL,
+//      completed_at        DATETIME,
+//      status              VARCHAR(16)  NOT NULL DEFAULT 'in_progress',
+//      transactions_fetched INT         DEFAULT 0,
+//      cursor_before       TEXT,
+//      cursor_after        TEXT,
+//      error_code          VARCHAR(64),
+//      error_message       TEXT
+//  );
+//
+//  CREATE INDEX idx_sync_conn ON sync_log(connection_id);
+//  CREATE INDEX idx_sync_time ON sync_log(started_at);
+//
+// ---------------------------------------------------------------------------
+// Agent Workflow — how an AI agent drives data acquisition
+// ---------------------------------------------------------------------------
+//
+// ## Initial Setup (one-time per institution)
+//
+//  1. Agent browses available providers and institutions:
+//     providers := registry.List()
+//     institutions, _ := provider.SearchInstitutions(ctx, "Chase")
+//
+//  2. Agent initiates linking:
+//     resp, _ := provider.InitiateLink(ctx, &LinkRequest{
+//         InstitutionID: "ins_3",
+//         Method:        LinkMethodOAuth,
+//         RedirectURI:   "http://localhost:8080/callback",
+//     })
+//     // For OAuth: present resp.LinkURL to user
+//     // For credential: may complete immediately
+//
+//  3. After OAuth callback or MFA:
+//     resp, _ := provider.CompleteOAuth(ctx, connID, &OAuthCallback{...})
+//     // resp.Accounts contains discovered remote accounts
+//
+//  4. Agent maps remote accounts to ledger accounts:
+//     connStore.MapToLedger(ctx, remoteAcctID, ledgerAcctID)
+//
+// ## Ongoing Sync (automated)
+//
+//  1. SyncOrchestrator.SyncAll() runs on schedule (e.g. daily)
+//  2. For each active connection:
+//     a. Fetch new transactions using stored cursor
+//     b. Bridge RawTransactions → StagedRecords in staging pipeline
+//     c. Update connection cursor for next sync
+//  3. Staging pipeline runs matching and categorization
+//
+// ## Error Recovery
+//
+//  1. Connection goes to "reauth" status (e.g. bank changed password):
+//     resp, _ := provider.ReauthConnection(ctx, connID)
+//     // Present re-auth flow to user
+//
+//  2. Connection errors:
+//     conn, _ := provider.RefreshConnection(ctx, connID)
+//     // Check conn.Status, conn.ErrorCode, conn.ErrorMessage
+//
+//  3. Consent expires (Open Banking):
+//     // Similar to reauth — new consent flow required
